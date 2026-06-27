@@ -1,0 +1,723 @@
+# ============================================================
+# Order Service — Inter-Service Message Contracts
+# ============================================================
+# Runtime  : Node.js / AWS Lambda orchestrated by AWS Step Functions
+# Role     : Source of truth for the order lifecycle. Owns the canonical
+#            `orders` table in Supabase/Postgres and the order status enum.
+#            Acts as the orchestrator ("brain") of every order.
+#
+# Channels : REST inbound          · Customer App, Restaurant App, internal services (API Gateway)
+#            SNS FIFO outbound      · fan-out to Delivery, Payment, Notification, Monitoring
+#            SQS FIFO inbound       · results consumed from Payment & Delivery services
+#            REST outbound          · synchronous calls to Catalog & Payment services
+#            Step Functions shapes  · state-machine input/output + task payloads
+#            Supabase write shapes  · canonical `orders` / `order_items` rows
+#            Supabase Realtime out  · live status to Customer App
+#            CloudWatch metrics     · custom metrics + alarms
+#
+# NOTE: Examples deliberately reuse the SAME ids and addresses as the
+#       delivery-service contract (order-xyz, rest-456, user-123, courier-001)
+#       so both documents describe ONE coherent end-to-end order.
+# ============================================================
+
+service: order-service
+runtime: "Node.js / AWS Lambda + Step Functions"
+
+# ------------------------------------------------------------
+# Canonical order status enum (OWNED by Order Service).
+# Every other service maps its local stage onto this list.
+# ------------------------------------------------------------
+_enums:
+  order_status: &order_status >-
+    CREATED | PENDING_PAYMENT | PAID | CONFIRMED | PREPARING | READY |
+    COURIER_ASSIGNED | PICKED_UP | ON_THE_WAY | DELIVERED |
+    CANCELLED | REFUNDED | FAILED
+
+  cancel_reason: &cancel_reason >-
+    PAYMENT_FAILED | RESTAURANT_REJECTED | RESTAURANT_TIMEOUT |
+    INVALID_ORDER | CUSTOMER_CANCELLED
+
+# ------------------------------------------------------------
+# Reusable anchors
+# ------------------------------------------------------------
+_anchors:
+  sns_fifo_topic: &sns_fifo_topic
+    arn:aws:sns:eu-west-1:123456789012:order-events.fifo
+
+  tel_aviv_restaurant_address: &restaurant_address
+    lat: 32.0853
+    lng: 34.7818
+    street: Rothschild Blvd 1
+    city: Tel Aviv
+
+  tel_aviv_customer_address: &customer_address
+    addressId: addr-789
+    lat: 32.0742
+    lng: 34.7922
+    street: Ben Yehuda St 44
+    city: Tel Aviv
+
+# ============================================================
+channels:
+
+  # ----------------------------------------------------------
+  # 1. REST API INBOUND
+  # Endpoints exposed by Order Service via API Gateway.
+  # Callers: Customer App (Next.js), Restaurant App (React),
+  #          and internal services (Delivery, Payment) with a service JWT.
+  # ----------------------------------------------------------
+  rest_api_inbound:
+
+    # --- Customer App ---------------------------------------
+    # Create a new order. Starts the Step Functions pre-payment pipeline.
+    "POST /api/v1/orders":
+      caller: customer-app
+      request:
+        headers:
+          Authorization: Bearer <customer_jwt>
+        body:
+          customerId: user-123
+          restaurantId: rest-456
+          items:
+            - menuItemId: item-1
+              quantity: 2
+              specialInstructions: "No onions"
+            - menuItemId: item-2
+              quantity: 1
+              specialInstructions: null
+          deliveryAddress: *customer_address
+          paymentMethod: CARD        # Enum: CARD | PAYPAL
+      response_202:
+        orderId: order-xyz
+        status: PENDING_PAYMENT
+        totalAmount: 78.50
+        currency: ILS
+        createdAt: "2026-06-23T18:45:00.000Z"
+        # URL returned by Payment Service; Customer App redirects here.
+        paymentUrl: "https://checkout.stripe.com/c/pay/cs_test_xyz"
+        restaurantConfirmationDeadline: "2026-06-23T18:50:00.000Z"
+      response_400:
+        error: UNAVAILABLE_ITEMS
+        message: "Some requested menu items are out of stock or unavailable."
+        details:
+          unavailableItems:
+            - item-2
+
+    # Customer fetches a single order (used for the tracking screen).
+    "GET /api/v1/orders/{orderId}":
+      caller: customer-app | admin-dashboard
+      request:
+        headers:
+          Authorization: Bearer <jwt_access_token>
+        pathParams:
+          orderId: order-xyz
+      response_200:
+        orderId: order-xyz
+        customerId: user-123
+        restaurantId: rest-456
+        restaurantName: HaBurger
+        status: ON_THE_WAY               # value from order_status enum
+        items:
+          - menuItemId: item-1
+            name: Shakshuka
+            quantity: 2
+            unitPrice: 32.00
+          - menuItemId: item-2
+            name: Lemonade
+            quantity: 1
+            unitPrice: 14.50
+        subtotal: 78.50
+        deliveryFee: 12.00
+        totalAmount: 90.50
+        currency: ILS
+        deliveryAddress: *customer_address
+        courierId: courier-001           # null until COURIER_ASSIGNED
+        estimatedDeliveryTime: "2026-06-23T19:30:00.000Z"
+        createdAt: "2026-06-23T18:45:00.000Z"
+        updatedAt: "2026-06-23T19:08:30.000Z"
+      response_404:
+        error: ORDER_NOT_FOUND
+        message: "No order found with id order-xyz"
+
+    # Customer lists their own order history (paginated).
+    "GET /api/v1/orders?customerId={customerId}&limit={limit}&cursor={cursor}":
+      caller: customer-app
+      request:
+        headers:
+          Authorization: Bearer <customer_jwt>
+        queryParams:
+          customerId: user-123
+          limit: 20
+          cursor: null
+      response_200:
+        orders:
+          - orderId: order-xyz
+            restaurantName: HaBurger
+            status: ON_THE_WAY
+            totalAmount: 90.50
+            currency: ILS
+            createdAt: "2026-06-23T18:45:00.000Z"
+        nextCursor: "eyJvZmZzZXQiOjIwfQ=="
+
+    # Customer cancels BEFORE the restaurant confirms (allowed states:
+    # PENDING_PAYMENT, PAID, CONFIRMED). Rejected once PREPARING.
+    "POST /api/v1/orders/{orderId}/cancel":
+      caller: customer-app
+      request:
+        headers:
+          Authorization: Bearer <customer_jwt>
+        pathParams:
+          orderId: order-xyz
+        body:
+          reason: CUSTOMER_CANCELLED      # see cancel_reason enum
+      response_200:
+        orderId: order-xyz
+        status: CANCELLED
+        refundStatus: PENDING             # Enum: NONE | PENDING | COMPLETED
+      response_409:
+        error: CANCELLATION_NOT_ALLOWED
+        message: "Order is already PREPARING and can no longer be cancelled."
+
+    # --- Restaurant App ------------------------------------
+    # Restaurant accepts the order. Resumes the post-payment state machine.
+    "POST /api/v1/orders/{orderId}/confirm":
+      caller: restaurant-app
+      request:
+        headers:
+          Authorization: Bearer <restaurant_jwt>
+        pathParams:
+          orderId: order-xyz
+        body:
+          restaurantId: rest-456
+          preparationTimeMinutes: 20
+      response_200:
+        orderId: order-xyz
+        status: CONFIRMED
+        estimatedPickupTime: "2026-06-23T19:05:00.000Z"
+
+    # Restaurant rejects the order → triggers refund + order.cancelled.
+    "POST /api/v1/orders/{orderId}/reject":
+      caller: restaurant-app
+      request:
+        headers:
+          Authorization: Bearer <restaurant_jwt>
+        pathParams:
+          orderId: order-xyz
+        body:
+          restaurantId: rest-456
+          # Enum: OUT_OF_STOCK | TOO_BUSY | CLOSED | OTHER
+          reason: TOO_BUSY
+      response_200:
+        orderId: order-xyz
+        status: CANCELLED
+        refundStatus: PENDING
+
+    # Status update endpoint. Two distinct callers:
+    #  (a) Restaurant App  → PREPARING, READY
+    #  (b) Delivery Service → PICKED_UP, ON_THE_WAY, DELIVERED, FAILED
+    # This is the SAME endpoint delivery-service calls in its rest_api_outbound.
+    "PATCH /api/v1/orders/{orderId}/status":
+      caller: restaurant-app | delivery-service (internal service JWT)
+      request:
+        headers:
+          Authorization: Bearer <restaurant_jwt | internal_service_jwt>
+        pathParams:
+          orderId: order-xyz
+        body:
+          # Subset of order_status the caller is allowed to set.
+          status: PICKED_UP
+          actorId: courier-001
+          timestamp: "2026-06-23T19:07:00.000Z"
+      response_200:
+        orderId: order-xyz
+        status: PICKED_UP
+        updatedAt: "2026-06-23T19:07:00.000Z"
+      response_409:
+        error: INVALID_STATUS_TRANSITION
+        message: "Cannot move from CONFIRMED to DELIVERED"
+
+    # ALB / API Gateway health check.
+    "GET /health":
+      response_200:
+        status: ok
+        checks:
+          supabase: ready
+          snsPublisher: ready
+          stepFunctions: ready
+        timestamp: "2026-06-23T19:00:00.000Z"
+      response_503:
+        status: degraded
+        checks:
+          supabase: error
+          snsPublisher: ready
+          stepFunctions: ready
+        timestamp: "2026-06-23T19:00:00.000Z"
+
+  # ----------------------------------------------------------
+  # 2. SNS FIFO OUTBOUND
+  # Published to 'order-events.fifo'. MessageGroupId = order_id
+  # guarantees strict per-order ordering across all consumers.
+  # Consumers: Delivery Service, Payment Service, Notification Service,
+  #            Monitoring/SLA Service.
+  # ----------------------------------------------------------
+  sns_fifo_outbound:
+
+    # Emitted after validation + price calc, before payment.
+    # Consumer: Payment Service (opens Stripe/PayPal session),
+    #           Monitoring Service (starts SLA timer).
+    order.created:
+      SNSTopicArn: *sns_fifo_topic
+      MessageGroupId: order_id
+      MessageDeduplicationId: "order_id + ':created'"
+      Subject: order.created
+      Message:
+        eventType: order.created
+        eventId: evt_01J0OS0001ABCD
+        timestamp: "2026-06-23T18:45:02.000Z"
+        orderId: order-xyz
+        customerId: user-123
+        restaurantId: rest-456
+        totalAmount: 78.50
+        currency: ILS
+        paymentMethod: CARD
+        status: PENDING_PAYMENT
+        actorId: user-123
+
+    # Emitted when payment succeeded AND restaurant accepted.
+    # >>> CONSUMED BY delivery-service (sqs_fifo_inbound.order.confirmed) <<<
+    # Field shape MUST match what Delivery Service expects.
+    order.confirmed:
+      SNSTopicArn: *sns_fifo_topic
+      MessageGroupId: order_id
+      MessageDeduplicationId: "order_id + ':confirmed'"
+      Subject: order.confirmed
+      Message:
+        eventType: order.confirmed
+        eventId: evt_01J0OS0002ABCD
+        timestamp: "2026-06-23T18:50:00.000Z"
+        orderId: order-xyz
+        customerId: user-123
+        restaurantId: rest-456
+        restaurantAddress: *restaurant_address
+        deliveryAddress: *customer_address
+        estimatedPickupTime: "2026-06-23T19:05:00.000Z"
+        estimatedDeliveryTime: "2026-06-23T19:30:00.000Z"
+        items:
+          - menuItemId: item-1
+            name: Shakshuka
+            quantity: 2
+        totalAmount: 78.50
+        currency: ILS
+        actorId: rest-456
+
+    # Emitted on any cancellation path (payment failed, restaurant rejected,
+    # confirmation timeout, customer cancelled).
+    # >>> CONSUMED BY delivery-service (sqs_fifo_inbound.order.cancelled) <<<
+    order.cancelled:
+      SNSTopicArn: *sns_fifo_topic
+      MessageGroupId: order_id
+      MessageDeduplicationId: "order_id + ':cancelled'"
+      Subject: order.cancelled
+      Message:
+        eventType: order.cancelled
+        eventId: evt_01J0OS0003ABCD
+        timestamp: "2026-06-23T18:55:00.000Z"
+        orderId: order-xyz
+        reason: RESTAURANT_REJECTED      # see cancel_reason enum
+        actorId: rest-456
+
+    # Emitted on intermediate lifecycle transitions (e.g. CONFIRMED -> PREPARING).
+    # Consumer: Notification Service, Monitoring/Analytics.
+    order.status_changed:
+      SNSTopicArn: *sns_fifo_topic
+      MessageGroupId: order_id
+      MessageDeduplicationId: "order_id + ':status_changed:' + newStatus"
+      Subject: order.status_changed
+      Message:
+        eventType: order.status_changed
+        eventId: evt_01J0OS0004ABCD
+        timestamp: "2026-06-23T18:52:00.000Z"
+        orderId: order-xyz
+        previousStatus: CONFIRMED
+        newStatus: PREPARING
+        actorId: rest-456
+
+    # Emitted when the kitchen marks the order READY.
+    # >>> CONSUMED BY delivery-service (sqs_fifo_inbound.order.status.ready) <<<
+    # courierId is included because Order Service already stored it from the
+    # delivery.courier_assigned event it consumed earlier.
+    order.status.ready:
+      SNSTopicArn: *sns_fifo_topic
+      MessageGroupId: order_id
+      MessageDeduplicationId: "order_id + ':ready'"
+      Subject: order.status.ready
+      Message:
+        eventType: order.status.ready
+        eventId: evt_01J0OS0005ABCD
+        timestamp: "2026-06-23T19:05:00.000Z"
+        orderId: order-xyz
+        restaurantId: rest-456
+        courierId: courier-001
+        actorId: rest-456
+
+    # Terminal success event after delivery is confirmed.
+    # Consumer: Notification Service (receipt), Monitoring (closes SLA).
+    order.completed:
+      SNSTopicArn: *sns_fifo_topic
+      MessageGroupId: order_id
+      MessageDeduplicationId: "order_id + ':completed'"
+      Subject: order.completed
+      Message:
+        eventType: order.completed
+        eventId: evt_01J0OS0006ABCD
+        timestamp: "2026-06-23T19:28:00.000Z"
+        orderId: order-xyz
+        customerId: user-123
+        restaurantId: rest-456
+        actualDeliveryTime: "2026-06-23T19:28:00.000Z"
+        totalAmount: 78.50
+        currency: ILS
+        actorId: SYSTEM
+
+    # Emitted after a refund is processed (restaurant reject / failed delivery).
+    # Consumer: Notification Service, Monitoring/Finance.
+    order.refunded:
+      SNSTopicArn: *sns_fifo_topic
+      MessageGroupId: order_id
+      MessageDeduplicationId: "order_id + ':refunded'"
+      Subject: order.refunded
+      Message:
+        eventType: order.refunded
+        eventId: evt_01J0OS0007ABCD
+        timestamp: "2026-06-23T18:56:00.000Z"
+        orderId: order-xyz
+        refundId: re_01J0PAY9999
+        amount: 78.50
+        currency: ILS
+        reason: RESTAURANT_REJECTED
+        actorId: SYSTEM
+
+  # ----------------------------------------------------------
+  # 3. SQS FIFO INBOUND
+  # Order Service subscribes 'order-service-inbound.fifo' to the shared
+  # SNS FIFO topic. MessageGroupId = order_id. DLQ after 3 failures.
+  # These are the events Order Service REACTS to in order to advance the
+  # state machine and update the canonical orders.status.
+  # ----------------------------------------------------------
+  sqs_fifo_inbound:
+
+    # Published by Payment Service when Stripe/PayPal confirms payment.
+    # Order Service: PENDING_PAYMENT -> PAID, then routes to restaurant.
+    payment.succeeded:
+      MessageGroupId: order_id
+      MessageDeduplicationId: "order_id + ':payment_succeeded'"
+      body:
+        eventType: payment.succeeded
+        eventId: evt_01J0PAY0001ABCD
+        timestamp: "2026-06-23T18:47:00.000Z"
+        orderId: order-xyz
+        paymentId: pi_01J0PAY1234
+        amount: 78.50
+        currency: ILS
+        actorId: user-123
+
+    # Published by Payment Service on decline / timeout (10-min window).
+    # Order Service: PENDING_PAYMENT -> CANCELLED (reason PAYMENT_FAILED).
+    payment.failed:
+      MessageGroupId: order_id
+      MessageDeduplicationId: "order_id + ':payment_failed'"
+      body:
+        eventType: payment.failed
+        eventId: evt_01J0PAY0002ABCD
+        timestamp: "2026-06-23T18:55:30.000Z"
+        orderId: order-xyz
+        # Enum: CARD_DECLINED | EXPIRED_SESSION | INSUFFICIENT_FUNDS | OTHER
+        reason: EXPIRED_SESSION
+        actorId: user-123
+
+    # Published by delivery-service (its sns_fifo_outbound.delivery.courier_assigned).
+    # Order Service: stores courierId, sets status COURIER_ASSIGNED.
+    delivery.courier_assigned:
+      MessageGroupId: order_id
+      MessageDeduplicationId: "order_id + ':courier_assigned'"
+      body:
+        eventType: delivery.courier_assigned
+        eventId: evt_01J0DS1234ABCD
+        timestamp: "2026-06-23T18:51:00.000Z"
+        orderId: order-xyz
+        courierId: courier-001
+        courierName: Avi Cohen
+        courierPhone: "+972501234567"
+        vehicleType: BICYCLE
+        estimatedPickupTime: "2026-06-23T19:05:00.000Z"
+        estimatedDeliveryTime: "2026-06-23T19:30:00.000Z"
+        actorId: SYSTEM
+
+    # Delivery stage events consumed to keep canonical orders.status in sync.
+    # Maps: picked_up->PICKED_UP, on_the_way->ON_THE_WAY,
+    #       delivered->DELIVERED (then emits order.completed),
+    #       failed->FAILED (then triggers refund flow).
+    delivery.status.changed:
+      MessageGroupId: order_id
+      MessageDeduplicationId: "order_id + ':delivery_status:' + stage"
+      body:
+        eventType: delivery.status.delivered   # one of delivery.status.*
+        eventId: evt_01J0DS4444ABCD
+        timestamp: "2026-06-23T19:28:00.000Z"
+        orderId: order-xyz
+        courierId: courier-001
+        # Enum: PICKED_UP | ON_THE_WAY | DELIVERED | FAILED
+        stage: DELIVERED
+        location:
+          lat: 32.0742
+          lng: 34.7922
+        actorId: courier-001
+
+  # ----------------------------------------------------------
+  # 4. REST API OUTBOUND
+  # Synchronous calls made BY Order Service TO other services.
+  # All use an internal service JWT.
+  # ----------------------------------------------------------
+  rest_api_outbound:
+
+    # Validate items + fetch authoritative prices and availability BEFORE
+    # creating the order. Target: Catalog/Menu Service.
+    "POST /api/v1/catalog/validate":
+      calledService: catalog-service
+      request:
+        headers:
+          Authorization: Bearer <internal_service_jwt>
+        body:
+          restaurantId: rest-456
+          items:
+            - menuItemId: item-1
+              quantity: 2
+            - menuItemId: item-2
+              quantity: 1
+      response_200:
+        valid: true
+        restaurantOpen: true
+        items:
+          - menuItemId: item-1
+            name: Shakshuka
+            unitPrice: 32.00
+            available: true
+          - menuItemId: item-2
+            name: Lemonade
+            unitPrice: 14.50
+            available: true
+        subtotal: 78.50
+        currency: ILS
+      response_409:
+        valid: false
+        unavailableItems:
+          - item-2
+
+    # Open a payment session. Target: Payment Service.
+    # (May also be invoked as a Step Functions task instead of direct REST.)
+    "POST /api/v1/payments/sessions":
+      calledService: payment-service
+      request:
+        headers:
+          Authorization: Bearer <internal_service_jwt>
+        body:
+          orderId: order-xyz
+          customerId: user-123
+          amount: 78.50
+          currency: ILS
+          method: CARD
+          # Where Stripe redirects after pay/cancel.
+          successUrl: "https://app.fooddelivery.co/orders/order-xyz/success"
+          cancelUrl: "https://app.fooddelivery.co/orders/order-xyz/cancel"
+      response_201:
+        paymentId: pi_01J0PAY1234
+        paymentUrl: "https://checkout.stripe.com/c/pay/cs_test_xyz"
+        expiresAt: "2026-06-23T18:55:00.000Z"   # 10-minute window
+
+  # ----------------------------------------------------------
+  # 5. STEP FUNCTIONS  (Order Service orchestration)
+  # Per Yuri's guidance the lifecycle is SPLIT into two state machines
+  # rather than one giant long-running execution:
+  #   (A) pre-payment SM   — short, synchronous: validate -> price -> create
+  #                           payment session -> wait for payment callback.
+  #   (B) post-payment SM  — wait for restaurant confirm -> READY ->
+  #                           wait for delivery terminal event -> complete.
+  # Shapes below are the execution input and per-task I/O payloads.
+  # ----------------------------------------------------------
+  step_functions:
+
+    # ----- (A) pre-payment state machine -----
+    pre_payment:
+      stateMachineArn: arn:aws:states:eu-west-1:123456789012:stateMachine:order-pre-payment
+      # States: ValidateItems -> CalculateTotals -> PersistOrder ->
+      #         CreatePaymentSession -> WaitForPayment (task token) ->
+      #         (PaymentSucceeded | PaymentFailed)
+      executionInput:
+        orderId: order-xyz
+        customerId: user-123
+        restaurantId: rest-456
+        items:
+          - menuItemId: item-1
+            quantity: 2
+            specialInstructions: "No onions"
+          - menuItemId: item-2
+            quantity: 1
+            specialInstructions: null
+        deliveryAddress: *customer_address
+        paymentMethod: CARD
+      # WaitForPayment resumes via SendTaskSuccess when payment.succeeded arrives.
+      waitForPayment_taskToken_payload:
+        taskToken: AAAAKgAAAAIAAAAA...exampleTaskToken
+        orderId: order-xyz
+        paymentId: pi_01J0PAY1234
+      output:
+        orderId: order-xyz
+        status: PAID
+
+    # ----- (B) post-payment state machine -----
+    post_payment:
+      stateMachineArn: arn:aws:states:eu-west-1:123456789012:stateMachine:order-post-payment
+      # States: NotifyRestaurant -> WaitForConfirmation (timeout 5 min) ->
+      #         (Confirmed -> WaitForReady -> EmitReady -> WaitForDelivery ->
+      #          Completed) | (Timeout/Reject -> Cancel + Refund)
+      executionInput:
+        orderId: order-xyz
+        customerId: user-123
+        restaurantId: rest-456
+        restaurantAddress: *restaurant_address
+        deliveryAddress: *customer_address
+        items:
+          - menuItemId: item-1
+            name: Shakshuka
+            quantity: 2
+        totalAmount: 78.50
+        currency: ILS
+      waitForConfirmation:
+        timeoutSeconds: 300            # 5-min restaurant confirmation deadline
+        onTimeout: cancel_with_reason_RESTAURANT_TIMEOUT
+      output:
+        orderId: order-xyz
+        status: DELIVERED
+        terminal: true
+
+  # ----------------------------------------------------------
+  # 6. SUPABASE / POSTGRES WRITE SHAPES
+  # Order Service is the ONLY writer of the canonical orders + order_items
+  # tables. Other services read via REST or react to SNS events.
+  # ----------------------------------------------------------
+  supabase_writes:
+
+    # Table: orders  (PK: id)
+    # Updated on every lifecycle transition; orders.status drives Realtime.
+    orders:
+      row:
+        id: order-xyz
+        customer_id: user-123
+        restaurant_id: rest-456
+        status: ON_THE_WAY              # order_status enum
+        subtotal: 78.50
+        delivery_fee: 12.00
+        total_amount: 90.50
+        currency: ILS
+        payment_id: pi_01J0PAY1234
+        payment_method: CARD
+        courier_id: courier-001         # null until COURIER_ASSIGNED
+        delivery_address: { lat: 32.0742, lng: 34.7922, street: "Ben Yehuda St 44", city: "Tel Aviv" }
+        estimated_delivery_time: "2026-06-23T19:30:00.000Z"
+        created_at: "2026-06-23T18:45:00.000Z"
+        updated_at: "2026-06-23T19:08:30.000Z"
+
+    # Table: order_items  (PK: id, FK: order_id) — one row per line item.
+    order_items:
+      row:
+        id: oitem-1
+        order_id: order-xyz
+        menu_item_id: item-1
+        name: Shakshuka
+        quantity: 2
+        unit_price: 32.00
+        special_instructions: "No onions"
+
+    # Table: order_status_history  (PK: id, FK: order_id) — append-only audit
+    # log of every status transition. Required by the spec ("хранит историю
+    # смены статусов"). One row written on each transition.
+    order_status_history:
+      row:
+        id: hist-1
+        order_id: order-xyz
+        previous_status: PICKED_UP      # null for the very first row (CREATED)
+        new_status: ON_THE_WAY          # order_status enum
+        # Enum: CUSTOMER | RESTAURANT | COURIER | SYSTEM
+        actor_type: COURIER
+        actor_id: courier-001
+        changed_at: "2026-06-23T19:08:30.000Z"
+
+  # ----------------------------------------------------------
+  # 7. SUPABASE REALTIME OUTBOUND -> CUSTOMER APP
+  # A write to orders.status replicates to Supabase Realtime; the Customer
+  # App subscribes to channel 'orders:order_id' for live tracking.
+  # (Delivery Service also writes courier GPS on a separate channel.)
+  # ----------------------------------------------------------
+  supabase_realtime_outbound:
+
+    realtime.order_status_changed:
+      schema: public
+      table: orders
+      eventType: UPDATE
+      new:
+        id: order-xyz
+        status: ON_THE_WAY
+        updated_at: "2026-06-23T19:08:30.000Z"
+      old:
+        id: order-xyz
+        status: PICKED_UP
+
+  # ----------------------------------------------------------
+  # 8. CLOUDWATCH CUSTOM METRICS
+  # Published via PutMetricData. Namespace: FoodDelivery/OrderService.
+  # Alarms fan out to the ops SNS alert topic.
+  # ----------------------------------------------------------
+  cloudwatch_metrics:
+
+    # Business volume — dashboards only, no alarm.
+    OrdersCreatedCount:
+      MetricName: OrdersCreatedCount
+      Namespace: FoodDelivery/OrderService
+      Unit: Count
+      Value: 1
+      Dimensions:
+        - Name: Environment
+          Value: production
+
+    # Alert: > 5% in any 15-min window → ops SNS alert
+    PaymentFailureRate:
+      MetricName: PaymentFailureRate
+      Namespace: FoodDelivery/OrderService
+      Unit: Percent
+      Value: 1.8
+      alarm_threshold: "> 5% over 15 min"
+
+    # Alert: > 15% in any 15-min window → ops SNS alert
+    RestaurantRejectionRate:
+      MetricName: RestaurantRejectionRate
+      Namespace: FoodDelivery/OrderService
+      Unit: Percent
+      Value: 4.2
+      alarm_threshold: "> 15% over 15 min"
+
+    # Time from order.created to order.confirmed.
+    # Alert: p95 > 360 s → ops SNS alert
+    OrderConfirmationLatencySeconds:
+      MetricName: OrderConfirmationLatencySeconds
+      Namespace: FoodDelivery/OrderService
+      Unit: Seconds
+      Value: 95
+      alarm_threshold: "p95 > 360 s"
+
+    # Alert: > 3 failures per 5-min window → ops SNS alert
+    StepFunctionsExecutionErrors:
+      MetricName: StepFunctionsExecutionErrors
+      Namespace: FoodDelivery/OrderService
+      Unit: Count
+      Value: 0
+      alarm_threshold: "> 3 errors / 5 min"
