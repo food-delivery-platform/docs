@@ -8,14 +8,13 @@ MenuService stores menu items in MongoDB. Internally, MongoDB uses `_id`, but ex
 
 ---
 
-## Common Types
+## REST API Summary
 
-```ts
-export type Currency = "ILS";
-
-export type MenuItemId = string; // UUID
-export type RestaurantId = string; // PostgreSQL restaurant UUID
-```
+- `POST /api/menu-items` — Add menu item
+- `PUT /api/menu-items/{id}` — Edit menu item
+- `GET /api/restaurants/{restaurantId}/menu-items` — Get available menu items by restaurant
+- `POST /api/menu-items/by-ids` — Get menu items by IDs
+- `POST /api/menu-items/validate` — Validate menu items for order creation
 
 ---
 
@@ -25,15 +24,15 @@ Used when MenuService returns menu item data to other services or frontends.
 
 ```ts
 export type MenuItemDto = {
-  id: MenuItemId;
-  restaurantId: RestaurantId;
+  id: string;
+  restaurantId: string;
 
   name: string;
   description?: string;
   category?: string;
 
   price: string; // Decimal128 serialized as string, example: "12.99"
-  currency: Currency;
+  currency: string;
 
   isAvailable: boolean;
 
@@ -72,20 +71,29 @@ export type MenuItemDto = {
 
 ## Add Menu Item
 
-Used by Restaurant App or Admin App to add a new menu item.
+Used by the Restaurant App to add a new menu item for a restaurant.
+
+- REST method: `POST`
+- Endpoint: `/api/menu-items`
+- Request body: `AddMenuItemRequestDto`
+- Response body: `AddMenuItemResponseDto`
+- HTTP statuses:
+  - `201 Created` on success
+  - `400 Bad Request` for validation errors
+  - `403 Forbidden` when the restaurant is not allowed
 
 ### Request
 
 ```ts
 export type AddMenuItemRequestDto = {
-  restaurantId: RestaurantId;
+  restaurantId: string;
 
   name: string;
   description?: string;
   category?: string;
 
   price: string; // example: "12.99"
-  currency: Currency;
+  currency: string;
 
   isAvailable?: boolean;
 
@@ -109,24 +117,77 @@ export type AddMenuItemResponseDto = {
 
 ---
 
-## Get Available Menu Items by Restaurant ID
+## Edit Menu Item
 
-Used by Customer App to display available menu items for a selected restaurant.
+Used by the Restaurant App to update an existing menu item.
+
+- REST method: `PUT`
+- Endpoint: `/api/menu-items/{id}`
+- Path parameter: `id` — menu item ID
+- Request body: `EditMenuItemRequestDto`
+- Response body: `EditMenuItemResponseDto`
+- HTTP statuses:
+  - `200 OK` on success
+  - `400 Bad Request` for invalid input
+  - `403 Forbidden` when the restaurant is not allowed
+  - `404 Not Found` when the item does not exist
 
 ### Request
 
 ```ts
-export type GetMenuItemsByRestaurantRequestDto = {
-  restaurantId: RestaurantId;
-  available?: true;
+export type EditMenuItemRequestDto = {
+  name?: string;
+  description?: string;
+  category?: string;
+
+  price?: string; // example: "12.99"
+  currency?: string;
+
+  isAvailable?: boolean;
+
+  ingredients?: string[];
+  allergens?: string[];
+
+  labels?: MenuItemDto["labels"];
+  portion?: MenuItemDto["portion"];
+  spicyLevel?: MenuItemDto["spicyLevel"];
+  nutrition?: MenuItemDto["nutrition"];
 };
 ```
 
 ### Response
 
 ```ts
+export type EditMenuItemResponseDto = {
+  item: MenuItemDto;
+};
+```
+
+---
+
+## Get Available Menu Items by Restaurant ID
+
+Used by Customer App to display available menu items for a selected restaurant.
+
+- REST method: `GET`
+- Endpoint: `/api/restaurants/{restaurantId}/menu-items`
+- Request: path parameter `restaurantId` and optional query parameter `available`
+- Response body: `GetMenuItemsByRestaurantResponseDto`
+- HTTP statuses:
+  - `200 OK` on success
+  - `400 Bad Request` for invalid query values
+  - `404 Not Found` when the restaurant does not exist
+
+### Request
+
+- Path parameter: `restaurantId`
+- Query parameter: `available?: true`
+
+### Response
+
+```ts
 export type GetMenuItemsByRestaurantResponseDto = {
-  restaurantId: RestaurantId;
+  restaurantId: string;
   items: MenuItemDto[];
 };
 ```
@@ -139,11 +200,19 @@ Used by Customer App when the user opens the cart.
 
 MenuService returns only items that still exist and are available.
 
+- REST method: `POST`
+- Endpoint: `/api/menu-items/by-ids`
+- Request body: `GetMenuItemsByIdsRequestDto`
+- Response body: `GetMenuItemsByIdsResponseDto`
+- HTTP statuses:
+  - `200 OK` on success
+  - `400 Bad Request` for invalid request payload
+
 ### Request
 
 ```ts
 export type GetMenuItemsByIdsRequestDto = {
-  menuItemIds: MenuItemId[];
+  menuItemIds: string[];
 };
 ```
 
@@ -152,8 +221,7 @@ export type GetMenuItemsByIdsRequestDto = {
 ```ts
 export type GetMenuItemsByIdsResponseDto = {
   items: MenuItemDto[];
-  missingItemIds: MenuItemId[];
-  unavailableItemIds: MenuItemId[];
+  unavailableItemIds: string[]; // includes IDs for items that are missing or not available
 };
 ```
 
@@ -162,6 +230,14 @@ export type GetMenuItemsByIdsResponseDto = {
 ## Validate Menu Items for Order Creation
 
 Used by OrderService before creating an order.
+
+- REST method: `POST`
+- Endpoint: `/api/menu-items/validate`
+- Request body: `ValidateMenuItemsForOrderRequestDto`
+- Response body: `ValidateMenuItemsForOrderResponseDto`
+- HTTP statuses:
+  - `200 OK` on success
+  - `400 Bad Request` for invalid request payload
 
 MenuService checks that all selected menu items:
 
@@ -176,13 +252,13 @@ MenuService checks that all selected menu items:
 
 ```ts
 export type ValidateMenuItemsForOrderRequestDto = {
-  restaurantId: RestaurantId;
+  restaurantId: string;
 
   items: {
-    menuItemId: MenuItemId;
+    menuItemId: string;
     quantity: number;
     expectedPrice: string; // price that customer saw, example: "12.99"
-    currency: Currency;
+    currency: string;
   }[];
 };
 ```
@@ -191,14 +267,14 @@ export type ValidateMenuItemsForOrderRequestDto = {
 
 ```ts
 export type ValidatedOrderMenuItemDto = {
-  menuItemId: MenuItemId;
-  restaurantId: RestaurantId;
+  menuItemId: string;
+  restaurantId: string;
 
   name: string;
   quantity: number;
 
   price: string;
-  currency: Currency;
+  currency: string;
 
   subtotal: string;
 };
@@ -210,12 +286,12 @@ export type ValidatedOrderMenuItemDto = {
 export type ValidateMenuItemsForOrderResponseDto = {
   valid: boolean;
 
-  restaurantId: RestaurantId;
+  restaurantId: string;
 
   items: ValidatedOrderMenuItemDto[];
 
   subtotal: string;
-  currency: Currency;
+  currency: string;
 
   errors: MenuValidationErrorDto[];
 };
@@ -225,7 +301,7 @@ export type ValidateMenuItemsForOrderResponseDto = {
 
 ```ts
 export type MenuValidationErrorDto = {
-  menuItemId?: MenuItemId;
+  menuItemId?: string;
 
   code:
     | "ITEM_NOT_FOUND"
