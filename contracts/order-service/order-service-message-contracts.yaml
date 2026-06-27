@@ -7,13 +7,27 @@
 #            Acts as the orchestrator ("brain") of every order.
 #
 # Channels : REST inbound          · Customer App, Restaurant App, internal services (API Gateway)
-#            SNS FIFO outbound      · fan-out to Delivery, Payment, Notification, Monitoring
+#            SNS FIFO outbound      · fan-out to Delivery, Notification, Monitoring
 #            SQS FIFO inbound       · results consumed from Payment & Delivery services
 #            REST outbound          · synchronous calls to Catalog & Payment services
 #            Step Functions shapes  · state-machine input/output + task payloads
-#            Supabase write shapes  · canonical `orders` / `order_items` rows
-#            Supabase Realtime out  · live status to Customer App
+#            Supabase write shapes  · canonical orders / order_items / order_status_history
+#            DynamoDB status (hot)  · live current status for high-frequency polling reads
 #            CloudWatch metrics     · custom metrics + alarms
+#
+# REVISION (sprint-1, incorporates Denis's review):
+#   1. pre-payment SM is NOT synchronous: it PAUSES on an async task-token
+#      callback while waiting for the payment result.
+#   2. High-frequency order-status READS are served from DynamoDB (hot store)
+#      to offload Supabase; Supabase stays the canonical + history store.
+#   3. Removed the generic PATCH /orders/{id}/status. Delivery updates status
+#      ONLY via SNS (consumed over SQS); the restaurant uses its own dedicated
+#      endpoints (/preparing, /ready). Added 403 where a caller may lack access.
+#   4. order.created is NOT consumed by Payment (the pre-payment SM calls
+#      Payment directly via REST to open the session).
+#   5. Payment retries: the customer may retry payment within the 10-min
+#      window; only window expiry (EXPIRED_SESSION) cancels the order.
+#      >>> OPEN: confirm the exact retry window with the team. <<<
 #
 # NOTE: Examples deliberately reuse the SAME ids and addresses as the
 #       delivery-service contract (order-xyz, rest-456, user-123, courier-001)
@@ -64,7 +78,9 @@ channels:
   # 1. REST API INBOUND
   # Endpoints exposed by Order Service via API Gateway.
   # Callers: Customer App (Next.js), Restaurant App (React),
-  #          and internal services (Delivery, Payment) with a service JWT.
+  #          and internal services with a service JWT.
+  # Every endpoint returns 403 FORBIDDEN if the caller is authenticated
+  # but not allowed to touch this particular order.
   # ----------------------------------------------------------
   rest_api_inbound:
 
@@ -94,7 +110,9 @@ channels:
         currency: ILS
         createdAt: "2026-06-23T18:45:00.000Z"
         # URL returned by Payment Service; Customer App redirects here.
+        # Stays valid for the whole 10-min window so the customer can retry.
         paymentUrl: "https://checkout.stripe.com/c/pay/cs_test_xyz"
+        paymentExpiresAt: "2026-06-23T18:55:00.000Z"
         restaurantConfirmationDeadline: "2026-06-23T18:50:00.000Z"
       response_400:
         error: UNAVAILABLE_ITEMS
@@ -102,10 +120,17 @@ channels:
         details:
           unavailableItems:
             - item-2
+      response_403:
+        error: FORBIDDEN
+        message: "You cannot create an order on behalf of another customer."
 
-    # Customer fetches a single order (used for the tracking screen).
+    # Customer fetches the FULL order (initial load of the tracking screen).
+    # Full details come from Supabase (canonical). For the repeated status
+    # polling that follows, the app calls the lightweight /status endpoint
+    # below, which reads from DynamoDB instead.
     "GET /api/v1/orders/{orderId}":
       caller: customer-app | admin-dashboard
+      readsFrom: supabase
       request:
         headers:
           Authorization: Bearer <jwt_access_token>
@@ -135,6 +160,32 @@ channels:
         estimatedDeliveryTime: "2026-06-23T19:30:00.000Z"
         createdAt: "2026-06-23T18:45:00.000Z"
         updatedAt: "2026-06-23T19:08:30.000Z"
+      response_403:
+        error: FORBIDDEN
+        message: "You do not have access to this order."
+      response_404:
+        error: ORDER_NOT_FOUND
+        message: "No order found with id order-xyz"
+
+    # Lightweight LIVE STATUS endpoint — this is the one polled ~every 10s by
+    # the customer tracking screen. Reads ONLY the current status, and reads
+    # it from DynamoDB (hot store, channel 7) so the hundreds of polls over an
+    # order's life never touch Supabase. (Per Denis's review.)
+    "GET /api/v1/orders/{orderId}/status":
+      caller: customer-app    # polled ~every 10s
+      readsFrom: dynamodb     # hot store, NOT Supabase
+      request:
+        headers:
+          Authorization: Bearer <customer_jwt>
+        pathParams:
+          orderId: order-xyz
+      response_200:
+        orderId: order-xyz
+        status: ON_THE_WAY
+        updatedAt: "2026-06-23T19:08:30.000Z"
+      response_403:
+        error: FORBIDDEN
+        message: "You do not have access to this order."
       response_404:
         error: ORDER_NOT_FOUND
         message: "No order found with id order-xyz"
@@ -142,6 +193,7 @@ channels:
     # Customer lists their own order history (paginated).
     "GET /api/v1/orders?customerId={customerId}&limit={limit}&cursor={cursor}":
       caller: customer-app
+      readsFrom: supabase
       request:
         headers:
           Authorization: Bearer <customer_jwt>
@@ -158,6 +210,9 @@ channels:
             currency: ILS
             createdAt: "2026-06-23T18:45:00.000Z"
         nextCursor: "eyJvZmZzZXQiOjIwfQ=="
+      response_403:
+        error: FORBIDDEN
+        message: "You can only list your own orders."
 
     # Customer cancels BEFORE the restaurant confirms (allowed states:
     # PENDING_PAYMENT, PAID, CONFIRMED). Rejected once PREPARING.
@@ -174,11 +229,18 @@ channels:
         orderId: order-xyz
         status: CANCELLED
         refundStatus: PENDING             # Enum: NONE | PENDING | COMPLETED
+      response_403:
+        error: FORBIDDEN
+        message: "You do not have access to this order."
       response_409:
         error: CANCELLATION_NOT_ALLOWED
         message: "Order is already PREPARING and can no longer be cancelled."
 
     # --- Restaurant App ------------------------------------
+    # The restaurant drives its own transitions with DEDICATED endpoints
+    # (confirm / reject / preparing / ready). There is no shared status
+    # endpoint anymore. Each one is restricted to the owning restaurant (403).
+
     # Restaurant accepts the order. Resumes the post-payment state machine.
     "POST /api/v1/orders/{orderId}/confirm":
       caller: restaurant-app
@@ -194,6 +256,9 @@ channels:
         orderId: order-xyz
         status: CONFIRMED
         estimatedPickupTime: "2026-06-23T19:05:00.000Z"
+      response_403:
+        error: FORBIDDEN
+        message: "This restaurant cannot modify this order."
 
     # Restaurant rejects the order → triggers refund + order.cancelled.
     "POST /api/v1/orders/{orderId}/reject":
@@ -211,30 +276,58 @@ channels:
         orderId: order-xyz
         status: CANCELLED
         refundStatus: PENDING
+      response_403:
+        error: FORBIDDEN
+        message: "This restaurant cannot modify this order."
 
-    # Status update endpoint. Two distinct callers:
-    #  (a) Restaurant App  → PREPARING, READY
-    #  (b) Delivery Service → PICKED_UP, ON_THE_WAY, DELIVERED, FAILED
-    # This is the SAME endpoint delivery-service calls in its rest_api_outbound.
-    "PATCH /api/v1/orders/{orderId}/status":
-      caller: restaurant-app | delivery-service (internal service JWT)
+    # Restaurant marks the order as being cooked (CONFIRMED -> PREPARING).
+    # Replaces the old shared PATCH for the restaurant side.
+    "POST /api/v1/orders/{orderId}/preparing":
+      caller: restaurant-app
       request:
         headers:
-          Authorization: Bearer <restaurant_jwt | internal_service_jwt>
+          Authorization: Bearer <restaurant_jwt>
         pathParams:
           orderId: order-xyz
         body:
-          # Subset of order_status the caller is allowed to set.
-          status: PICKED_UP
-          actorId: courier-001
-          timestamp: "2026-06-23T19:07:00.000Z"
+          restaurantId: rest-456
       response_200:
         orderId: order-xyz
-        status: PICKED_UP
-        updatedAt: "2026-06-23T19:07:00.000Z"
+        status: PREPARING
+        updatedAt: "2026-06-23T18:52:00.000Z"
+      response_403:
+        error: FORBIDDEN
+        message: "This restaurant cannot modify this order."
       response_409:
         error: INVALID_STATUS_TRANSITION
-        message: "Cannot move from CONFIRMED to DELIVERED"
+        message: "Order must be CONFIRMED before it can move to PREPARING."
+
+    # Restaurant marks the food ready (PREPARING -> READY).
+    # Emits order.status.ready (consumed by Delivery Service).
+    "POST /api/v1/orders/{orderId}/ready":
+      caller: restaurant-app
+      request:
+        headers:
+          Authorization: Bearer <restaurant_jwt>
+        pathParams:
+          orderId: order-xyz
+        body:
+          restaurantId: rest-456
+      response_200:
+        orderId: order-xyz
+        status: READY
+        updatedAt: "2026-06-23T19:05:00.000Z"
+      response_403:
+        error: FORBIDDEN
+        message: "This restaurant cannot modify this order."
+      response_409:
+        error: INVALID_STATUS_TRANSITION
+        message: "Order must be PREPARING before it can move to READY."
+
+    # NOTE: There is NO PATCH /api/v1/orders/{orderId}/status anymore.
+    #   - Delivery Service changes status ONLY by publishing its own SNS events
+    #     (Order Service consumes them via sqs_fifo_inbound.delivery.*).
+    #   - The restaurant uses the dedicated endpoints above.
 
     # ALB / API Gateway health check.
     "GET /health":
@@ -242,6 +335,7 @@ channels:
         status: ok
         checks:
           supabase: ready
+          dynamodb: ready
           snsPublisher: ready
           stepFunctions: ready
         timestamp: "2026-06-23T19:00:00.000Z"
@@ -249,6 +343,7 @@ channels:
         status: degraded
         checks:
           supabase: error
+          dynamodb: ready
           snsPublisher: ready
           stepFunctions: ready
         timestamp: "2026-06-23T19:00:00.000Z"
@@ -257,14 +352,15 @@ channels:
   # 2. SNS FIFO OUTBOUND
   # Published to 'order-events.fifo'. MessageGroupId = order_id
   # guarantees strict per-order ordering across all consumers.
-  # Consumers: Delivery Service, Payment Service, Notification Service,
-  #            Monitoring/SLA Service.
+  # Consumers: Delivery Service, Notification Service, Monitoring/SLA Service.
+  # NOTE: Payment Service is NOT a consumer of these events — the pre-payment
+  #       state machine calls Payment directly via REST (rest_api_outbound).
   # ----------------------------------------------------------
   sns_fifo_outbound:
 
     # Emitted after validation + price calc, before payment.
-    # Consumer: Payment Service (opens Stripe/PayPal session),
-    #           Monitoring Service (starts SLA timer).
+    # Consumers: Monitoring Service (starts SLA timer), Analytics.
+    # >>> NOT consumed by Payment (per Denis). <<<
     order.created:
       SNSTopicArn: *sns_fifo_topic
       MessageGroupId: order_id
@@ -310,8 +406,8 @@ channels:
         currency: ILS
         actorId: rest-456
 
-    # Emitted on any cancellation path (payment failed, restaurant rejected,
-    # confirmation timeout, customer cancelled).
+    # Emitted on any cancellation path (payment failed/expired, restaurant
+    # rejected, confirmation timeout, customer cancelled).
     # >>> CONSUMED BY delivery-service (sqs_fifo_inbound.order.cancelled) <<<
     order.cancelled:
       SNSTopicArn: *sns_fifo_topic
@@ -379,7 +475,8 @@ channels:
         currency: ILS
         actorId: SYSTEM
 
-    # Emitted after a refund is processed (restaurant reject / failed delivery).
+    # Emitted after a refund is processed (restaurant reject / failed delivery /
+    # expired payment after a charge).
     # Consumer: Notification Service, Monitoring/Finance.
     order.refunded:
       SNSTopicArn: *sns_fifo_topic
@@ -421,18 +518,27 @@ channels:
         currency: ILS
         actorId: user-123
 
-    # Published by Payment Service on decline / timeout (10-min window).
-    # Order Service: PENDING_PAYMENT -> CANCELLED (reason PAYMENT_FAILED).
+    # Published by Payment Service on a failed attempt.
+    # RETRY MODEL (per Denis's question #5):
+    #   retryable = true  -> a single decline does NOT cancel the order. It
+    #                        stays PENDING_PAYMENT, paymentUrl stays open, and
+    #                        the customer may retry within the 10-min window.
+    #   retryable = false -> the 10-min window elapsed (reason EXPIRED_SESSION)
+    #                        -> Order Service: PENDING_PAYMENT -> CANCELLED
+    #                        (cancel_reason PAYMENT_FAILED) + order.cancelled.
+    # >>> OPEN: confirm the retry window length / max attempts with the team. <<<
     payment.failed:
       MessageGroupId: order_id
-      MessageDeduplicationId: "order_id + ':payment_failed'"
+      MessageDeduplicationId: "order_id + ':payment_failed:' + attempt"
       body:
         eventType: payment.failed
         eventId: evt_01J0PAY0002ABCD
         timestamp: "2026-06-23T18:55:30.000Z"
         orderId: order-xyz
-        # Enum: CARD_DECLINED | EXPIRED_SESSION | INSUFFICIENT_FUNDS | OTHER
-        reason: EXPIRED_SESSION
+        # Enum: CARD_DECLINED | INSUFFICIENT_FUNDS | EXPIRED_SESSION | OTHER
+        reason: CARD_DECLINED
+        attempt: 1                     # 1-based attempt counter within the window
+        retryable: true                # false once the 10-min window expires
         actorId: user-123
 
     # Published by delivery-service (its sns_fifo_outbound.delivery.courier_assigned).
@@ -454,6 +560,8 @@ channels:
         actorId: SYSTEM
 
     # Delivery stage events consumed to keep canonical orders.status in sync.
+    # This is HOW the courier/delivery status reaches Order Service — via SNS,
+    # NOT via a REST call (the old PATCH endpoint was removed).
     # Maps: picked_up->PICKED_UP, on_the_way->ON_THE_WAY,
     #       delivered->DELIVERED (then emits order.completed),
     #       failed->FAILED (then triggers refund flow).
@@ -514,7 +622,8 @@ channels:
           - item-2
 
     # Open a payment session. Target: Payment Service.
-    # (May also be invoked as a Step Functions task instead of direct REST.)
+    # This is WHY order.created does not need to go to Payment — the pre-payment
+    # state machine creates the session here, directly and synchronously.
     "POST /api/v1/payments/sessions":
       calledService: payment-service
       request:
@@ -532,26 +641,28 @@ channels:
       response_201:
         paymentId: pi_01J0PAY1234
         paymentUrl: "https://checkout.stripe.com/c/pay/cs_test_xyz"
-        expiresAt: "2026-06-23T18:55:00.000Z"   # 10-minute window
+        expiresAt: "2026-06-23T18:55:00.000Z"   # 10-minute window (retries allowed)
 
   # ----------------------------------------------------------
   # 5. STEP FUNCTIONS  (Order Service orchestration)
-  # Per Yuri's guidance the lifecycle is SPLIT into two state machines
-  # rather than one giant long-running execution:
-  #   (A) pre-payment SM   — short, synchronous: validate -> price -> create
-  #                           payment session -> wait for payment callback.
-  #   (B) post-payment SM  — wait for restaurant confirm -> READY ->
-  #                           wait for delivery terminal event -> complete.
-  # Shapes below are the execution input and per-task I/O payloads.
+  # IMPORTANT: neither machine is "synchronous".
+  #   - The pre-payment machine is SHORT-LIVED but ASYNCHRONOUS: it suspends
+  #     at WaitForPayment on a task-token callback until the payment result
+  #     arrives (or the 10-min window expires). It does not block a thread.
+  #   - The post-payment machine is an event-driven, long-running orchestration
+  #     that waits for external callbacks (restaurant confirm, delivery events).
+  # Per Yuri's guidance the lifecycle is SPLIT into these two state machines
+  # rather than one giant long-running execution.
   # ----------------------------------------------------------
   step_functions:
 
     # ----- (A) pre-payment state machine -----
     pre_payment:
       stateMachineArn: arn:aws:states:eu-west-1:123456789012:stateMachine:order-pre-payment
+      execution_model: asynchronous (task-token callback at WaitForPayment)
       # States: ValidateItems -> CalculateTotals -> PersistOrder ->
       #         CreatePaymentSession -> WaitForPayment (task token) ->
-      #         (PaymentSucceeded | PaymentFailed)
+      #         (PaymentSucceeded | PaymentExpired)
       executionInput:
         orderId: order-xyz
         customerId: user-123
@@ -565,7 +676,14 @@ channels:
             specialInstructions: null
         deliveryAddress: *customer_address
         paymentMethod: CARD
-      # WaitForPayment resumes via SendTaskSuccess when payment.succeeded arrives.
+      # WaitForPayment suspends the execution; it resumes via SendTaskSuccess
+      # when payment.succeeded arrives. Multiple payment attempts are allowed
+      # while the timeout has not elapsed.
+      waitForPayment:
+        type: task_token_callback        # asynchronous; NOT a blocking call
+        timeoutSeconds: 600              # 10-min window; retries allowed within it
+        resumesOn: payment.succeeded
+        onTimeout: cancel_with_reason_PAYMENT_FAILED   # EXPIRED_SESSION
       waitForPayment_taskToken_payload:
         taskToken: AAAAKgAAAAIAAAAA...exampleTaskToken
         orderId: order-xyz
@@ -577,6 +695,7 @@ channels:
     # ----- (B) post-payment state machine -----
     post_payment:
       stateMachineArn: arn:aws:states:eu-west-1:123456789012:stateMachine:order-post-payment
+      execution_model: asynchronous, event-driven (waits for restaurant + delivery callbacks)
       # States: NotifyRestaurant -> WaitForConfirmation (timeout 5 min) ->
       #         (Confirmed -> WaitForReady -> EmitReady -> WaitForDelivery ->
       #          Completed) | (Timeout/Reject -> Cancel + Refund)
@@ -593,7 +712,8 @@ channels:
         totalAmount: 78.50
         currency: ILS
       waitForConfirmation:
-        timeoutSeconds: 300            # 5-min restaurant confirmation deadline
+        type: task_token_callback        # asynchronous
+        timeoutSeconds: 300              # 5-min restaurant confirmation deadline
         onTimeout: cancel_with_reason_RESTAURANT_TIMEOUT
       output:
         orderId: order-xyz
@@ -601,20 +721,29 @@ channels:
         terminal: true
 
   # ----------------------------------------------------------
-  # 6. SUPABASE / POSTGRES WRITE SHAPES
-  # Order Service is the ONLY writer of the canonical orders + order_items
-  # tables. Other services read via REST or react to SNS events.
+  # 6. SUPABASE / POSTGRES WRITE SHAPES  (canonical + history = system of record)
+  # Order Service is the ONLY writer of the canonical orders + order_items +
+  # order_status_history tables.
+  #
+  # READ PATH: high-frequency status polling is NOT served from here — it is
+  # served from DynamoDB (channel 7) to keep Supabase load low. Supabase is
+  # read for the full order (initial load) and for history/reporting.
+  #
+  # STATUS-CHANGE WRITE FLOW (per Denis):
+  #   1. read the current status from DynamoDB (channel 7)
+  #   2. write the new status to Supabase orders, AND append a row to
+  #      order_status_history (previous_status = the old value from DynamoDB)
+  #   3. upsert the new current status back into DynamoDB (channel 7)
   # ----------------------------------------------------------
   supabase_writes:
 
-    # Table: orders  (PK: id)
-    # Updated on every lifecycle transition; orders.status drives Realtime.
+    # Table: orders  (PK: id) — canonical record. Updated on every transition.
     orders:
       row:
         id: order-xyz
         customer_id: user-123
         restaurant_id: rest-456
-        status: ON_THE_WAY              # order_status enum
+        status: ON_THE_WAY              # order_status enum (canonical copy)
         subtotal: 78.50
         delivery_fee: 12.00
         total_amount: 90.50
@@ -639,8 +768,8 @@ channels:
         special_instructions: "No onions"
 
     # Table: order_status_history  (PK: id, FK: order_id) — append-only audit
-    # log of every status transition. Required by the spec ("хранит историю
-    # смены статусов"). One row written on each transition.
+    # log of every status transition. previous_status is taken from DynamoDB
+    # (the value that was current before this change).
     order_status_history:
       row:
         id: hist-1
@@ -653,24 +782,30 @@ channels:
         changed_at: "2026-06-23T19:08:30.000Z"
 
   # ----------------------------------------------------------
-  # 7. SUPABASE REALTIME OUTBOUND -> CUSTOMER APP
-  # A write to orders.status replicates to Supabase Realtime; the Customer
-  # App subscribes to channel 'orders:order_id' for live tracking.
-  # (Delivery Service also writes courier GPS on a separate channel.)
+  # 7. DYNAMODB — HOT ORDER STATUS  (live read path for polling)
+  # A single-item-per-order table holding ONLY the current live status.
+  # Purpose (per Denis): absorb the high-frequency status polling (~1 request
+  # every 10s per active order, hundreds over an order's life) so Supabase is
+  # NOT hit on every poll.
+  #   WRITE: on every transition (step 3 of the write flow in channel 6).
+  #   READ : by GET /api/v1/orders/{orderId}/status (channel 1).
   # ----------------------------------------------------------
-  supabase_realtime_outbound:
-
-    realtime.order_status_changed:
-      schema: public
-      table: orders
-      eventType: UPDATE
-      new:
-        id: order-xyz
-        status: ON_THE_WAY
-        updated_at: "2026-06-23T19:08:30.000Z"
-      old:
-        id: order-xyz
-        status: PICKED_UP
+  dynamodb_order_status:
+    table: order-status-live
+    keySchema:
+      partitionKey: orderId
+    # Upserted on every status transition.
+    write_item:
+      orderId: order-xyz
+      status: ON_THE_WAY
+      previousStatus: PICKED_UP
+      updatedAt: "2026-06-23T19:08:30.000Z"
+      ttlEpoch: 1750800000            # auto-expire ~24h after a terminal state
+    # Returned to the polling endpoint.
+    read_item:
+      orderId: order-xyz
+      status: ON_THE_WAY
+      updatedAt: "2026-06-23T19:08:30.000Z"
 
   # ----------------------------------------------------------
   # 8. CLOUDWATCH CUSTOM METRICS
