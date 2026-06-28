@@ -586,7 +586,7 @@ graph TB
     end
 
     subgraph Compute["Backend Compute"]
-        AG2[API Gateway\nREST] --> LMB[Lambda Functions\nper Microservice (incl. Delivery Service)]
+        AG2[API Gateway\nREST] --> LMB["Lambda Functions\nper Microservice (incl. Delivery Service)"]
         LMB --> SBD[(Supabase\nPostgreSQL)]
         LMB --> DYN[(DynamoDB\nOn-demand)]
         LMB --> MDB2[(MongoDB Atlas\nSessions)]
@@ -1143,9 +1143,9 @@ graph TB
     end
 
     CA -->|GET /deliveries/available| BE
-    CA -->|POST /deliveries/{id}/accept| AE
-    CA -->|POST /deliveries/{id}/stage\nPATCH /couriers/{id}/location| SM
-    CU -->|POST /deliveries/{id}/confirm-delivery| SM
+    CA -->|POST /deliveries/:id/accept| AE
+    CA -->|POST /deliveries/:id/stage\nPATCH /couriers/:id/location| SM
+    CU -->|POST /deliveries/:id/confirm-delivery| SM
     SQS_C --> AE
     AE -->|Read courier_states| DY
     AE -->|Write assignments| SB
