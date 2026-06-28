@@ -797,37 +797,211 @@ sequenceDiagram
 
 ---
 
-## 12. Project Structure (Monorepo)
+## 12. Project Structure (Monorepo — Feature-Sliced Design)
+
+Frontend apps follow **[Feature-Sliced Design](https://feature-sliced.design/)** (FSD): code is split into layers (`app → pages → widgets → features → entities → shared`), and each layer contains slices by business domain. Nothing in a lower layer may import from a higher layer.
+
+Backend services mirror the same philosophy: each service is sliced by use-case, not by technical role.
+
+---
+
+### 12.1 Top-Level Monorepo
 
 ```
 food-delivery/
-├── infrastructure/
-│   ├── cloudformation/       # VPC, DynamoDB, SNS Standard, SQS Standard, Cognito stacks
-│   └── sam/                  # SAM templates per Lambda service
+├── infrastructure/            # AWS IaC
+│   ├── cloudformation/        # DynamoDB, SNS Standard, SQS Standard, Cognito, IAM, VPC
+│   └── sam/                   # SAM templates — one per Lambda service
 │
-├── services/
-│   ├── user-service/         # Node.js Lambda
-│   ├── catalog-service/      # Node.js Lambda
-│   ├── order-service/        # Node.js Lambda
-│   ├── delivery-service/     # Node.js Lambda (REST broadcast model)
-│   ├── payment-service/      # Node.js Lambda
-│   ├── notification-service/ # Node.js Lambda
-│   ├── monitoring-service/   # Node.js Scheduled Lambda
-│   ├── analytics-service/    # Python FastAPI Lambda
-│   ├── ai-chat-service/      # Node.js Lambda (Bedrock/OpenAI router + RAG)
-│   └── kb-ingestion-service/ # Python Lambda (chunk → embed → pgvector upsert)
+├── services/                  # Backend microservices (FSD-inspired slices)
+│   ├── order-service/         ← expanded in §12.3
+│   ├── delivery-service/
+│   ├── catalog-service/
+│   ├── payment-service/
+│   ├── user-service/
+│   ├── notification-service/
+│   ├── monitoring-service/
+│   ├── analytics-service/
+│   ├── ai-chat-service/
+│   └── kb-ingestion-service/
 │
-├── frontend/
-│   ├── customer-app/         # Next.js (SSR/SSG for SEO)
-│   ├── restaurant-dashboard/ # React
-│   ├── courier-app/          # React PWA
-│   └── ops-dashboard/        # React
+├── frontend/                  # Four FSD apps
+│   ├── customer-app/          ← expanded in §12.2
+│   ├── restaurant-dashboard/  ← brief in §12.4
+│   ├── courier-app/           ← brief in §12.4
+│   └── ops-dashboard/         ← brief in §12.4
 │
-└── shared/
-    ├── types/                # Shared TypeScript types
-    ├── events/               # SNS/SQS event schemas
-    ├── middleware/           # JWT validation, error handler
-    └── ai/                   # Bedrock/OpenAI client wrappers, prompt templates
+└── shared/                    # Cross-app FSD shared layer (§12.5)
+```
+
+---
+
+### 12.2 Frontend — `customer-app/` (canonical FSD example)
+
+> Next.js · SSR/SSG · NextAuth.js · TypeScript
+
+```
+customer-app/
+│
+├── app/                          # [FSD: app] — global bootstrap
+│   ├── providers/                # NextAuth SessionProvider, QueryClient, theme
+│   ├── styles/                   # global CSS, Tailwind config
+│   └── layout.tsx                # root layout (header, footer, chat widget mount)
+│
+├── pages/                        # [FSD: pages] — Next.js file-system routing
+│   ├── index.tsx                 # Home — restaurant discovery
+│   ├── restaurants/
+│   │   └── [restaurantId].tsx    # Restaurant detail + menu
+│   ├── cart.tsx
+│   ├── checkout.tsx
+│   ├── orders/
+│   │   └── [orderId]/
+│   │       └── tracking.tsx      # Live order tracking (polls every 5 s)
+│   ├── profile.tsx
+│   └── history.tsx
+│
+├── widgets/                      # [FSD: widgets] — self-contained UI blocks
+│   ├── CartDrawer/               # Slide-in cart with item list + totals
+│   ├── OrderTracker/             # Stage progress bar + courier last-location
+│   ├── ConfirmDeliveryBanner/    # Appears when order reaches PICKED_UP
+│   ├── RestaurantCard/           # Card used on home + search results
+│   ├── MenuSection/              # Category header + item grid
+│   └── AIChatWidget/             # Floating chat button + slide-in panel (SSE)
+│
+├── features/                     # [FSD: features] — user interactions
+│   ├── authenticate/             # NextAuth.js sign-in / sign-out / session guard
+│   ├── browse-restaurants/       # Search, filter by cuisine, sort by rating
+│   ├── manage-cart/              # Add / remove / update item quantities
+│   ├── place-order/              # Checkout flow → POST /orders → redirect to tracking
+│   ├── track-order/              # Polling hook → feeds OrderTracker widget
+│   ├── confirm-delivery/         # POST /deliveries/{id}/confirm-delivery
+│   └── ai-chat/                  # Send message → SSE stream → render tokens
+│
+├── entities/                     # [FSD: entities] — domain models + their UI fragments
+│   ├── order/
+│   │   ├── model.ts              # Order type, status enum, selectors
+│   │   └── OrderStatusBadge.tsx  # Coloured badge (PREPARING / PICKED_UP / …)
+│   ├── restaurant/
+│   │   ├── model.ts
+│   │   └── RestaurantRating.tsx
+│   ├── menu-item/
+│   │   ├── model.ts              # MenuItem type (includes timeToPrepare, nutrition)
+│   │   └── MenuItemCard.tsx
+│   ├── cart/
+│   │   └── model.ts              # Cart slice (Zustand or Redux Toolkit)
+│   ├── address/
+│   │   └── model.ts
+│   └── user/
+│       └── model.ts              # Customer profile, auth state
+│
+└── shared/                       # [FSD: shared] — no business logic
+    ├── ui/                       # Design system atoms (Button, Input, Modal, Badge …)
+    ├── api/                      # Typed fetch wrappers per resource
+    │   ├── orders.ts
+    │   ├── restaurants.ts
+    │   ├── deliveries.ts
+    │   └── chat.ts
+    ├── lib/                      # Pure utilities
+    │   ├── geo.ts                # Distance calculation, coord formatting
+    │   ├── currency.ts           # ILS / USD formatting
+    │   └── date.ts               # Relative time, ETA display
+    └── config/                   # Env vars, API base URLs, feature flags
+```
+
+---
+
+### 12.3 Backend — `order-service/` (canonical FSD-inspired example)
+
+> Node.js Lambda · TypeScript · AWS Step Functions
+
+```
+order-service/
+│
+├── handlers/                     # Lambda entry points (API Gateway routes)
+│   ├── createOrder.ts            # POST /orders
+│   ├── getOrder.ts               # GET /orders/{orderId}
+│   ├── updateStatus.ts           # PATCH /orders/{orderId}/status
+│   └── paymentCallback.ts        # POST /orders/payment-callback (Stripe webhook)
+│
+├── features/                     # Business use-case slices
+│   ├── create-order/
+│   │   ├── index.ts              # orchestrates validate → DynamoDB write → SNS publish
+│   │   ├── validateItems.ts      # calls Catalog Service REST
+│   │   └── publishPreparing.ts   # publishes order.preparing to SNS Standard
+│   ├── update-status/
+│   │   ├── index.ts
+│   │   └── archiveOnTerminal.ts  # writes to Supabase on DELIVERED / CANCELLED / FAILED
+│   └── step-functions/
+│       └── stateMachine.json     # Step Functions Express Workflow definition
+│
+├── entities/                     # Domain models + validation
+│   ├── order.ts                  # Order type, status enum (PENDING → DELIVERED)
+│   ├── orderItem.ts
+│   └── schemas.ts                # Zod schemas for request validation
+│
+└── shared/                       # Service-local infrastructure adapters
+    ├── db.ts                     # DynamoDB DocumentClient (active_orders table)
+    ├── supabase.ts               # Supabase client (archive writes)
+    ├── snsPublisher.ts           # Typed SNS Standard publish helper
+    └── middleware.ts             # JWT auth, error handler, logger
+```
+
+All other services follow the same four-folder pattern (`handlers / features / entities / shared`). Key slices per service:
+
+| Service | Notable feature slices |
+|---|---|
+| **delivery-service** | `broadcast-orders`, `assign-courier` (first-writer conditional write), `update-stage`, `confirm-delivery`, `update-location` |
+| **catalog-service** | `manage-menu`, `ai-dish-card` (Bedrock call → `ai_generated` JSONB write), `toggle-availability` |
+| **payment-service** | `create-intent`, `confirm-payment`, `refund` |
+| **user-service** | `register`, `authenticate` (Cognito + NextAuth.js token exchange), `manage-address` |
+| **notification-service** | `notify-order-status`, `notify-courier-assigned`, `notify-delivery-confirmed` |
+| **monitoring-service** | `check-sla-violations`, `publish-alerts` |
+| **ai-chat-service** | `embed-query`, `retrieve-chunks` (pgvector), `route-llm`, `stream-response` |
+| **kb-ingestion-service** | `chunk-document`, `embed-chunks`, `upsert-pgvector` |
+
+---
+
+### 12.4 Frontend — Other Apps (brief FSD slice lists)
+
+**`restaurant-dashboard/`** — React · Cognito auth
+
+| Layer | Slices |
+|---|---|
+| pages | `orders`, `menu`, `reports`, `settings` |
+| widgets | `OrderQueue`, `MenuEditor`, `DishCardForm`, `SalesChart` |
+| features | `manage-menu`, `ai-dish-card` (name/photo → Bedrock → prefill form), `mark-order-ready`, `toggle-availability`, `view-reports` |
+| entities | `incoming-order`, `menu-item` (incl. `timeToPrepare`, `nutrition`, `aiGenerated`), `restaurant` |
+
+**`courier-app/`** — React PWA · Cognito auth
+
+| Layer | Slices |
+|---|---|
+| pages | `available`, `delivery/[id]`, `earnings`, `profile` |
+| widgets | `AvailableOrdersList`, `ActiveDeliveryCard`, `DeliveryStageControls` |
+| features | `browse-available-orders` (polls `GET /deliveries/available?lat&lng&radius`), `accept-delivery` (first-writer), `update-stage`, `confirm-delivery`, `update-location` (REST PATCH ~30 s) |
+| entities | `available-delivery`, `active-delivery`, `courier` |
+
+**`ops-dashboard/`** — React · Cognito ADMIN role
+
+| Layer | Slices |
+|---|---|
+| pages | `dashboard`, `orders`, `couriers`, `restaurants`, `users`, `alerts` |
+| widgets | `OrderBoard` (pipeline view), `AlertInbox`, `CourierTable`, `SLAIndicator` |
+| features | `monitor-orders`, `view-alerts`, `manage-couriers`, `manage-restaurants`, `manage-users` |
+| entities | `order`, `courier`, `restaurant`, `alert`, `sla-violation` |
+
+---
+
+### 12.5 Cross-App `shared/` Layer
+
+Shared code consumed by all frontend apps and backend services. **No business logic lives here.**
+
+```
+shared/
+├── types/                        # Canonical TypeScript types (Order, MenuItem, Courier …)
+├── events/                       # SNS/SQS event payload schemas (order.preparing, delivery.* …)
+├── middleware/                   # JWT validation (Cognito + NextAuth.js), error handler, logger
+└── ai/                           # Bedrock / OpenAI client wrappers, prompt templates
 ```
 
 ---
