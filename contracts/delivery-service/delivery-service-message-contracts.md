@@ -13,7 +13,7 @@
 | 2 | [SNS FIFO Outbound](#2-sns-fifo-outbound) | Delivery Service → | SNS FIFO `order-events.fifo` |
 | 3 | [WebSocket Inbound](#3-websocket-inbound--courier-app--delivery-service) | Courier App → Delivery Service | WebSocket port 8080 |
 | 4 | [WebSocket Outbound → Courier](#4-websocket-outbound--delivery-service--courier-app) | Delivery Service → Courier App | WebSocket port 8080 |
-| 5 | [WebSocket Outbound → Customer](#5-websocket-outbound--delivery-service--customer-app) | Delivery Service → Customer App | Supabase Realtime |
+| 5 | [Supabase Realtime Outbound → Customer](#5-supabase-realtime-outbound--delivery-service--customer-app) | Delivery Service → Customer App | Supabase Realtime (GPS only) |
 | 6 | [REST Inbound](#6-rest-api-inbound) | Clients → Delivery Service | API Gateway / HTTPS |
 | 7 | [REST Outbound](#7-rest-api-outbound) | Delivery Service → Services | Internal HTTPS |
 | 8 | [DynamoDB Writes](#8-dynamodb-write-shapes) | Delivery Service → DynamoDB | AWS SDK |
@@ -480,36 +480,13 @@ Sent when Delivery Service rejects a courier frame — auth failure, invalid sta
 
 ---
 
-## 5. WebSocket Outbound — Delivery Service → Customer App
+## 5. Supabase Realtime Outbound — Delivery Service → Customer App
 
-> Delivery Service writes stage changes to the Supabase `orders` table.  
-> PostgreSQL logical replication → **Supabase Realtime** → Customer App WebSocket.  
-> No direct WebSocket connection between Delivery Service and Customer App.
-
----
-
-### `realtime.order_status_changed`
-
-Supabase Realtime `UPDATE` payload received by the Customer App on channel `orders:order_id`. Triggered whenever Delivery Service writes a new value to `orders.status`.
-
-```json
-{
-  "schema": "public",
-  "table": "orders",
-  "eventType": "UPDATE",
-  "new": {
-    "id": "order-xyz",
-    "status": "ON_THE_WAY",
-    "updated_at": "2026-06-23T19:08:30.000Z"
-  },
-  "old": {
-    "id": "order-xyz",
-    "status": "PICKED_UP"
-  }
-}
-```
-
-> `status` reflects the updated `orders.status` column value directly.
+> **Order status is no longer delivered via Supabase Realtime.**  
+> The Customer App polls `GET /api/v1/deliveries/{orderId}` every 5 seconds to get order status (reads DynamoDB `active_orders`).  
+>
+> Supabase Realtime is used **only** for GPS courier-position updates.  
+> A thin **Lambda bridge** upserts DynamoDB GPS writes into the Supabase `active_courier_positions` view; PostgreSQL logical replication → Realtime fans out to subscribed customers.
 
 ---
 
@@ -544,8 +521,9 @@ Customer subscribes to channel `courier_positions:order_id`.
 
 ### `GET /api/v1/deliveries/{orderId}`
 
-Returns current delivery state for an order.  
-**Callers:** Customer App · Ops Dashboard · Order Service.
+Returns current delivery state for an order. Reads from DynamoDB `active_orders` (order status) and `courier_states` (courier location).  
+**Callers:** Customer App · Ops Dashboard · Order Service.  
+**Primary tracking mechanism for Customer App** — polled every 5 seconds in place of Supabase Realtime.
 
 **Request**
 ```
@@ -739,7 +717,7 @@ Authorization: Bearer <internal_service_jwt>
 
 ### `PATCH /api/v1/orders/{orderId}/status` → Order Service
 
-Called by the **Stage State Machine** to update the canonical order status in Order Service / Supabase whenever a delivery stage changes.
+Called by the **Stage State Machine** whenever a delivery stage changes. Order Service updates `active_orders` in DynamoDB (`UpdateItem`). On terminal states (`DELIVERED` / `FAILED`), Order Service additionally archives the complete order record to Supabase PostgreSQL (`orders` + `order_items` tables) and deletes the DynamoDB item once the archive write succeeds.
 
 **Request body**
 ```json
