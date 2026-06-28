@@ -1,7 +1,7 @@
 # Food Delivery Platform — High Level Architecture (HLA) + MVP Plan
 
 **Scale:** ~100,000 users | 300 restaurants | 2,000 couriers  
-**Stack:** Next.js (Customer Web) + React (Ops apps) · Node.js/FastAPI · AWS Lambda · Supabase (PostgreSQL + pgvector) · DynamoDB · MongoDB Atlas · AWS (Cognito, SQS FIFO, SNS FIFO, Bedrock, CloudWatch, Fargate, S3/CloudFront) · OpenAI API (optional)
+**Stack:** Next.js (Customer Web) + React (Ops apps) · Node.js/FastAPI · AWS Lambda · Supabase (PostgreSQL + pgvector) · DynamoDB · MongoDB Atlas · AWS (Cognito [Restaurant/Admin/Courier], SNS Standard, SQS Standard, Bedrock, CloudWatch, S3/CloudFront) · NextAuth.js (Customer auth) · OpenAI API (optional)
 
 ---
 
@@ -10,7 +10,7 @@
 The platform covers the **full delivery lifecycle** with real-time monitoring of every stage:
 
 ```
-Customer → Browse → Order → Payment → Preparation → Pickup → Delivery → Confirmed
+Customer → Browse → Order → Payment → [auto] Preparing → Pickup → Delivered
                                   ↑ Every stage is tracked & monitored ↑
 ```
 
@@ -42,19 +42,20 @@ graph LR
     end
 
     subgraph Gateway["API Layer"]
-        AG[AWS API Gateway\nREST + WebSocket]
+        AG[AWS API Gateway\nREST]
     end
 
     subgraph Auth["Authentication"]
-        COG[AWS Cognito\nUser Pools]
+        COG[AWS Cognito\nRestaurant / Admin / Courier]
+        NAUTH[NextAuth.js\nCustomer sessions\nHTTP-only cookies]
         JWT[JWT Authorizer]
     end
 
-    subgraph Services["Backend Microservices (Lambda + Fargate)"]
+    subgraph Services["Backend Microservices (Lambda)"]
         US[User Service]
         CS[Catalog Service]
         OS[Order Service]
-        DS[Delivery & Tracking Service]
+        DS[Delivery Service]
         PS[Payment Service]
         NS[Notification Service]
         MS[Monitoring & Alerting Service]
@@ -77,8 +78,7 @@ graph LR
     end
 
     subgraph Messaging["Event Bus"]
-        SQS[AWS SQS FIFO\nOrder events\nordered + exactly-once]
-        SNSP[AWS SNS FIFO\nInternal fan-out\nto SQS FIFO subscribers]
+        SNS[AWS SNS Standard\nOrder events\nfan-out to SQS Standard queues]
         SNSE[AWS SNS Standard\nSMS / Email / Push\nto end users]
     end
 
@@ -93,7 +93,7 @@ graph LR
     AG --> Services
     Services --> Data
     Services --> Messaging
-    SNSP --> NS
+    SNS --> NS
     Services --> CW
     CW --> SNSE
     SNSE -->|SMS / Email alerts| OD
@@ -116,7 +116,7 @@ flowchart LR
 
 FR["Frontends\nCustomer / Restaurant / Courier / Admin"]
 
-ENTRY["API Gateway + Cognito\nREST API + JWT Auth"]
+ENTRY["API Gateway\nREST API + JWT Auth (Cognito / NextAuth.js)"]
 
 subgraph OrderServiceStack[" "]
 direction TB
@@ -168,7 +168,7 @@ style OrderServiceStack fill:transparent,stroke:transparent,color:transparent
 **Key flows illustrated:**
 - **Synchronous orchestration** (solid arrows): Order Service calls Menu Service to validate item availability and Payment Service to initiate checkout; Delivery Service feeds ETA and courier updates back into Order Service
 - **Payment callback loop**: Payment provider posts confirmation back through API Gateway → Order Service state transition
-- **Async fan-out** (Event Bus): Order and delivery events publish to SNS + SQS FIFO; independent subscriber services (Restaurant Dashboard, Notifications, Monitoring, Analytics) consume without blocking the critical path
+- **Async fan-out** (Event Bus): Order and delivery events publish to SNS Standard → SQS Standard queues; independent subscriber services (Notifications, Monitoring, Analytics) consume without blocking the critical path
 - **Shared sinks**: All services write to the unified data layer and push metrics/logs to CloudWatch
 
 ---
@@ -179,7 +179,7 @@ style OrderServiceStack fill:transparent,stroke:transparent,color:transparent
 
 **Pages / Features:**
 - SEO-first pages with SSR/SSG (home, cuisine/category, restaurant, item details)
-- Login / Registration (Cognito Hosted UI or custom with JWT)
+- Login / Registration (NextAuth.js — HTTP-only cookies)
 - Browse restaurants & shops (search, filter, category)
 - Product catalog & cart
 - Order placement & payment
@@ -191,21 +191,20 @@ style OrderServiceStack fill:transparent,stroke:transparent,color:transparent
 ### 3.2 Restaurant & Shop Dashboard (React)
 
 **Pages / Features:**
-- Login (role: `RESTAURANT` or `SHOP`)
-- Incoming orders queue (real-time, WebSocket)
-- Order acceptance / reject / ready status
-- Menu management (CRUD)
+- Login (role: `RESTAURANT` — Cognito)
+- Incoming orders queue (polling `GET /orders?status=preparing` every 5 seconds)
+- Mark order READY when food is prepared
+- Menu management (CRUD) with AI-assisted dish card filling — AI helper generates description, calories, and nutrition parameters from dish name or photo (Bedrock)
 - Availability toggle (open / closed)
 - Sales reports (daily, weekly)
 
 ### 3.3 Courier App (React PWA)
 
 **Pages / Features:**
-- Login (role: `COURIER`)
-- Available delivery tasks map
-- Accept / decline task
-- Stage updates: `PICKED_UP → ON_THE_WAY → DELIVERED`
-- GPS location push (every 10 sec → DynamoDB)
+- Login (role: `COURIER` — Cognito)
+- Browse available orders within X km of current location; first courier to accept wins the assignment
+- Stage updates: `PICKED_UP → DELIVERED`
+- Location update via REST (~30 sec interval when actively delivering)
 - Earnings summary
 
 ### 3.4 Operations & Monitoring Dashboard (React)
@@ -224,7 +223,7 @@ style OrderServiceStack fill:transparent,stroke:transparent,color:transparent
 
 ### 4.1 Architecture Overview
 
-The backend follows an **event-driven microservices** architecture with strict domain boundaries. Each service owns its data, exposes async-first APIs, and communicates via SNS FIFO + SQS FIFO to guarantee per-order event ordering. This eliminates tight coupling while maintaining transactional integrity for order workflows.
+The backend follows an **event-driven microservices** architecture with strict domain boundaries. Each service owns its data, exposes async-first APIs, and communicates via SNS Standard + SQS Standard for async fan-out. This eliminates tight coupling while maintaining transactional integrity for order workflows.
 
 ```mermaid
 ---
@@ -236,7 +235,7 @@ config:
 graph LR
     subgraph Core["Core Order Processing"]
         OS[Order Service\nLambda]
-        DS[Delivery Service\nFargate]
+        DS[Delivery Service\nLambda]
         PS[Payment Service\nLambda]
     end
 
@@ -253,8 +252,8 @@ graph LR
         KBS[KB Ingestion\nLambda]
     end
 
-    subgraph EventBus["Event Bus (SNS FIFO + SQS FIFO)"]
-        SNF["SNS FIFO Topic\norder-events.fifo\n(MessageGroupId=order_id)"]
+    subgraph EventBus["Event Bus (SNS Standard + SQS Standard)"]
+        SNF["SNS Standard Topic\norder-events"]
     end
 
     subgraph Data["Data Stores"]
@@ -263,11 +262,11 @@ graph LR
         MDB[(MongoDB Atlas\nSessions)]
     end
 
-    OS -->|order.created\norder.status.*| SNF
+    OS -->|order.preparing\norder.status.*| SNF
     PS -->|payment.confirmed\npayment.failed| SNF
-    SNF -->|SQS FIFO| DS
-    SNF -->|SQS FIFO| NS
-    SNF -->|SQS FIFO| MS
+    SNF -->|SQS Standard| DS
+    SNF -->|SQS Standard| NS
+    SNF -->|SQS Standard| MS
     
     OS -->|direct DB write| SB
     OS -.->|REST: read menu\nrestaurants, prices| CS
@@ -286,11 +285,11 @@ graph LR
 
 | Service | Domain | Responsibility | Runtime | Concurrency | API Type |
 |---|---|---|---|---|---|
-| **Order Service** | Order Processing | Order creation, state machine (PENDING→DELIVERED), event publishing | Lambda (Node.js) | 500–1000 concurrent | REST + SNS publisher |
-| **Payment Service** | Payment | Idempotent payment intent creation, confirmation, refunds. Stripe/payment provider integration | Lambda (Node.js) | 100–200 concurrent | REST + SNS publisher |
-| **Delivery Service** | Delivery Coordination | Courier assignment, real-time GPS tracking, stage updates (PICKED_UP→DELIVERED) | Fargate (persistent) | 5–10 tasks | WebSocket + SNS subscriber |
+| **Order Service** | Order Processing | Order creation, state machine (PENDING→PREPARING→READY→PICKED_UP→DELIVERED), event publishing | Lambda (Node.js) | 500–1000 concurrent | REST + SNS publisher |
+| **Payment Service** | Payment | Payment intent creation, confirmation, refunds. Stripe/payment provider integration | Lambda (Node.js) | 100–200 concurrent | REST + SNS publisher |
+| **Delivery Service** | Delivery Coordination | Courier broadcast + proximity assignment, stage updates (PICKED_UP→DELIVERED) | Lambda (Node.js) | 50–200 concurrent | REST + SNS subscriber |
 | **User Service** | Identity & Profile | User registration, authentication, profile/address management, role assignment | Lambda (Node.js) | 200–500 concurrent | REST |
-| **Catalog Service** | Catalog | Menu/product CRUD, category management, availability toggles, search indexing | Lambda (Node.js) | 50–100 concurrent | REST + Supabase triggers |
+| **Catalog Service** | Catalog | Menu/product CRUD, category management, availability toggles, search indexing, AI-assisted dish card generation (Bedrock) | Lambda (Node.js) | 50–100 concurrent | REST + Supabase triggers |
 | **Notification Service** | Notifications | Order status notifications (SMS/email/push via SNS Standard), template rendering | Lambda (Node.js) | 200–500 concurrent | SNS subscriber |
 | **Monitoring Service** | Operations | SLA tracking, overdue order detection, alert generation (5-min schedule) | Scheduled Lambda | 1–2 concurrent | CloudWatch → SNS |
 | **Analytics Service** | Business Intelligence | Daily/weekly aggregations, restaurant stats, order trends | Lambda (Python/FastAPI) | 10–50 concurrent | REST |
@@ -306,21 +305,20 @@ graph LR
 - **Catalog Service** ← Customer/Restaurant apps (browse menu, update availability)
 - Used for **read-heavy** or **non-blocking** operations. No dependency on event ordering.
 
-#### Asynchronous (SNS FIFO + SQS FIFO) — Order-Critical Events
-- **Order Service** → SNS FIFO → **Delivery Service**, **Notification Service**, **Monitoring Service**
-- **Why FIFO?** Per-order event ordering is **critical**: `PENDING→CONFIRMED→READY→PICKED_UP→DELIVERED` must process in strict sequence
-- **MessageGroupId = order_id** ensures single-threaded processing per order
-- **MessageDeduplicationId** (5-minute window) prevents duplicate event processing on retry
+#### Asynchronous (SNS Standard + SQS Standard) — Order Events
+
+- **Order Service** → SNS Standard → **Delivery Service**, **Notification Service**, **Monitoring Service**
+- **Why Standard (not FIFO)?** At MVP scale (100K users, 300 restaurants), Standard SNS/SQS is simpler to operate, ~10× cheaper, and has no 300 TPS limit. Each consumer checks current order state before acting, handling any rare duplicates gracefully.
 
 **Event Publishing Pattern:**
 ```
-Order Service publishes event → SNS FIFO (single topic)
+Order Service publishes event → SNS Standard (single topic)
                             ↓
-                    (fan-out via Subnodes)
-                    ↙          ↓          ↘
-            SQS FIFO (DS)  SQS FIFO (NS)  SQS FIFO (MS)
-                ↓              ↓              ↓
-         [Delivery Svc]  [Notification]  [Monitoring]
+                    (fan-out via subscriptions)
+                    ↙            ↓            ↘
+          SQS Standard (DS)  SQS Standard (NS)  SQS Standard (MS)
+                ↓                  ↓                  ↓
+         [Delivery Svc]      [Notification]      [Monitoring]
 ```
 
 Each consumer (DS, NS, MS) operates independently without blocking others. Failure in one queue (e.g., Notification down) doesn't block Delivery or Monitoring.
@@ -334,20 +332,17 @@ Each consumer (DS, NS, MS) operates independently without blocking others. Failu
 |---|---|---|---|
 | Order Service | 30 sec | Exponential backoff (1s, 2s, 4s) on DB transient errors | N/A (Supabase is highly available) |
 | Payment Service | 60 sec | Max 3 retries on network errors; fail-open on timeout (manual reconciliation queue) | Stripe API circuit breaker (fail-safe mode) |
-| Delivery Service | 900 sec (Fargate) | N/A (persistent connection) | WebSocket reconnect logic every 10 sec |
+| Delivery Service | 30 sec (Lambda) | Exponential backoff (1s, 2s, 4s) on transient errors | N/A |
 | Notification Service | 60 sec | SNS Standard handles retries (max 15 minutes); DLQ captures permanent failures | SNS built-in retry policy |
 
 #### Dead Letter Queues (DLQ)
-- **SQS FIFO DLQ** attached to each consumer queue (DS, NS, MS)
+- **SQS Standard DLQ** attached to each consumer queue (DS, NS, MS)
 - Messages that fail > 3 times go to DLQ for manual inspection
 - Separate Lambda monitors DLQ and alerts ops on poison messages
 - Example: corrupted event schema → moved to DLQ, doesn't block queue
 
 #### Idempotency
-- **Order Service**: Order creation is idempotent via `order_id` as deduplication key in Supabase
-- **Payment Service**: Stripe `idempotency_key` prevents double-charging on retries
-- **Notification Service**: Events tagged with unique `event_id` to skip duplicate sends
-- All events include `timestamp` and `actor_id` for audit trail
+Application-level idempotency (DynamoDB `idempotency_records` table) is deferred post-MVP. Stripe's native `idempotency_key` prevents double-charging at the payment layer. All events include `timestamp` and `actor_id` for audit trail.
 
 ---
 
@@ -360,14 +355,14 @@ Each consumer (DS, NS, MS) operates independently without blocking others. Failu
 - Example: Order creation is atomic — a single DynamoDB `PutItem` issues the `orderId` and sets `PENDING` status
 
 #### Eventual Consistency — Event-Driven Updates
-- **Order status propagation**: Order Service writes status transitions to DynamoDB `active_orders` → publishes SNS FIFO events → Monitoring/Notification services consume; on terminal state, archives full order to Supabase PostgreSQL
+- **Order status propagation**: Order Service writes status transitions to DynamoDB `active_orders` → publishes SNS Standard events → Monitoring/Notification services consume; on terminal state, archives full order to Supabase PostgreSQL
 - Clients may see stale order status for up to 5 seconds (polling interval)
-- **Acceptable trade-off**: Customer App polls `GET /api/v1/orders/{orderId}` for order status; GPS courier position is still pushed via Supabase Realtime
+- **Acceptable trade-off**: Customer App polls `GET /api/v1/orders/{orderId}` for order status
 
 #### No Distributed Transactions
 - **Why?** Synchronous 2PC across services is slow and brittle. Instead:
   - Order Service writes to DB + publishes event atomically
-  - Consumers are responsible for idempotent processing of events
+  - Consumers check current state before acting, handling rare duplicate deliveries gracefully
   - If a service crashes mid-processing, SQS retries the message
 
 ---
@@ -379,13 +374,13 @@ Each consumer (DS, NS, MS) operates independently without blocking others. Failu
 |---|---|---|---|
 | Order Service | 200 concurrent | 500 (lunch peak 12–14:00) | Queue incoming requests; alert ops if > 30 sec wait |
 | Payment Service | 50 concurrent | 100 | Fail immediately if throttled (return 429 to client) |
-| Delivery Service (Fargate) | 2–5 tasks | 10 tasks (lunch peak) | Auto-scale via ECS target tracking (CPU > 70%) |
+| Delivery Service (Lambda) | 50 concurrent | 200 concurrent (lunch peak) | Lambda auto-scales; concurrency limit 200 |
 | Notification Service | 200 concurrent | 500 | SNS handles queueing; Lambda processes from SQS |
 
 #### Environment Promotion
 - **Dev**: All services co-located in single AWS account, logging to CloudWatch Logs Insights
 - **Staging**: Identical production stack; blue/green deployment via CloudFormation
-- **Production**: Multi-AZ Fargate for Delivery Service; Lambda auto-replicated across AZs
+- **Production**: All services on Lambda (auto-replicated across AZs)
 
 #### CI/CD Pipeline
 - GitHub Actions triggers on push to `main` branch
@@ -404,7 +399,7 @@ Each consumer (DS, NS, MS) operates independently without blocking others. Failu
 | Service | Owned Tables | External Dependencies |
 |---|---|---|
 | Order Service | `active_orders` (DynamoDB — live state); `orders`, `order_items` (Supabase — archive on terminal state) | Reads: `menu_items`, `restaurants`, `payments` (via REST, cached) |
-| Delivery Service | `assignments`, `courier_states`, `courier_locations`, `order_events` (→ DynamoDB) | Reads: `active_orders`, `couriers` (via REST/cache) |
+| Delivery Service | `assignments`, `courier_states`, `order_events` (→ DynamoDB) | Reads: `active_orders`, `couriers` (via REST/cache) |
 | Payment Service | `payments` | Reads: `orders` (via REST); writes event to SNS |
 | Notification Service | `notification_log` (audit only) | Reads: `orders`, `users` (via REST) |
 | User Service | `users`, `addresses`, `profiles` | N/A |
@@ -423,7 +418,7 @@ Each consumer (DS, NS, MS) operates independently without blocking others. Failu
 |---|---|---|
 | Order Service | P99 latency, order creation errors, event publication lag | > 2 sec latency, > 5% error rate |
 | Payment Service | Payment failures, Stripe API latency, idempotency key mismatches | > 100 failed payments/hour, > 30 sec latency |
-| Delivery Service | WebSocket connection count, GPS update lag, courier assignment lag | Connection drops > 10%, GPS lag > 20 sec |
+| Delivery Service | Courier assignment lag, unaccepted order count, stage transition errors | Assignment lag > 60 sec, unaccepted orders > 5 for > 5 min |
 | Notification Service | Notification send failures, SMS delivery lag | > 1% failure rate, > 5 min delay |
 | Monitoring Service | SLA violations detected, false-positive alerts | > 50 overdue orders, > 100 false alarms/day |
 
@@ -456,10 +451,10 @@ Each consumer (DS, NS, MS) operates independently without blocking others. Failu
 {
   "orderId": "order-xyz",
   "status": "PENDING",
-  "createdAt": "2026-06-23T18:45:00Z",
-  "restaurantConfirmationDeadline": "2026-06-23T18:50:00Z"
+  "createdAt": "2026-06-23T18:45:00Z"
 }
 ```
+> Upon payment confirmation, status automatically transitions to `PREPARING` without any restaurant action.
 
 **On Error (400 Bad Request):**
 ```json
@@ -479,13 +474,7 @@ Each consumer (DS, NS, MS) operates independently without blocking others. Failu
 #### Initialization (Cold Start Optimization)
 - **Lambda**: Node.js runtime pre-warmed via CloudWatch Events (ping every 5 min to keep warm)
   - Cold start ~500 ms (acceptable for MVP)
-- **Fargate**: Services start within 30 sec; health check endpoint `/health` returns 200 when ready
 - **Database connections**: Pooled via PgBouncer (Supabase managed); MongoDB Atlas connection pooling built-in
-
-#### Graceful Shutdown (Fargate only)
-- On ECS task termination, Delivery Service gets 30-second grace period (SIGTERM)
-- Service flushes in-flight GPS updates to DynamoDB, closes WebSocket connections
-- Active deliveries are reassigned via background Lambda (within 2 minutes)
 
 ---
 
@@ -495,10 +484,10 @@ Each consumer (DS, NS, MS) operates independently without blocking others. Failu
 |---|---|---|---|
 | **User Service** | Register, profile, address, roles | Lambda (Node.js) | Cognito, Supabase |
 | **Catalog Service** | Menu, products, categories, availability | Lambda (Node.js) | Supabase, S3 (images) |
-| **Order Service** | Order lifecycle state machine, event publishing | Lambda (Node.js) | Supabase, SNS FIFO, Stripe |
-| **Delivery Service** | Courier assignment, GPS tracking, stage updates | Fargate (persistent WebSocket) | DynamoDB, Supabase Realtime, SNS FIFO |
-| **Payment Service** | Payment intent, confirm, refund | Lambda (Node.js) | Stripe API, SNS FIFO |
-| **Notification Service** | Push / SMS / email via SNS | Lambda (Node.js) | SNS Standard, SQS FIFO |
+| **Order Service** | Order lifecycle state machine, event publishing | Lambda (Node.js) | Supabase, SNS Standard, Stripe |
+| **Delivery Service** | Courier broadcast + proximity assignment, stage updates (PICKED_UP→DELIVERED) | Lambda (Node.js) | DynamoDB, Supabase, SNS Standard |
+| **Payment Service** | Payment intent, confirm, refund | Lambda (Node.js) | Stripe API, SNS Standard |
+| **Notification Service** | Push / SMS / email via SNS | Lambda (Node.js) | SNS Standard, SQS Standard |
 | **Monitoring Service** | Check stage SLAs, alert on overdue orders | Scheduled Lambda | DynamoDB, CloudWatch, SNS |
 | **Analytics Service** | Reports, aggregations | Lambda (Python/FastAPI) | Supabase, MongoDB Atlas |
 | **AI Chat Service** | RAG retrieval + LLM routing (Bedrock/OpenAI) | Lambda (Node.js) | Bedrock, OpenAI, Supabase pgvector, MongoDB Atlas |
@@ -517,70 +506,67 @@ config:
 ---
 stateDiagram-v2
     [*] --> PENDING: Customer places order
-    PENDING --> CONFIRMED: Restaurant accepts
-    PENDING --> CANCELLED: Restaurant rejects / timeout
-    CONFIRMED --> PREPARING: Kitchen starts
-    PREPARING --> READY: Food ready for pickup
-    READY --> PICKED_UP: Courier picks up
-    PICKED_UP --> ON_THE_WAY: Courier en route
-    ON_THE_WAY --> DELIVERED: Customer confirms
-    ON_THE_WAY --> FAILED: Delivery issue
+    PENDING --> PREPARING: Payment confirmed (automatic)
+    PENDING --> CANCELLED: Payment failed / customer cancelled
+    PREPARING --> READY: Kitchen marks order ready
+    PREPARING --> CANCELLED: Restaurant closes / item unavailable
+    READY --> PICKED_UP: Courier picks up food
+    PICKED_UP --> DELIVERED: Courier + customer both confirm
+    PICKED_UP --> FAILED: Delivery failure reported
     DELIVERED --> [*]
     CANCELLED --> [*]
     FAILED --> [*]
 ```
 
-**Every transition** → SNS FIFO topic → fan-out to SQS FIFO queues → triggers Notification + Monitoring services. Order ID used as **MessageGroupId** — guarantees per-order event ordering.
+**Every transition** → SNS Standard topic `order-events` → fan-out to SQS Standard queues → triggers Notification + Monitoring services. No photo required for delivery confirmation — both courier and customer tap "Confirm" in their respective apps.
 
 ---
 
 ## 6. Data Layer Design
 
-### Supabase (PostgreSQL + Realtime — permanent record store)
+### Supabase (PostgreSQL — permanent record store)
 ```
 users            (id, email, phone, role, cognito_sub, created_at)
 restaurants      (id, name, owner_id, address, is_open, rating)
-menu_items       (id, restaurant_id, name, price, category, image_url)
+menu_items       (id, restaurant_id, name, price, category, image_key,
+                  time_to_prepare, labels jsonb, nutrition jsonb, ai_generated jsonb)
 couriers         (id, user_id, vehicle_type, is_available)
 payments         (id, order_id, provider_ref, status, amount)
 ```
+> `menu_items` — stored entirely in Supabase (moved from MongoDB Atlas). `time_to_prepare` (minutes) is used for ETA calculation. `ai_generated` JSONB stores AI helper output (description, calories, nutrition) populated by Catalog Service via Bedrock.
+>
 > `orders` / `order_items` — written **once** on terminal state (DELIVERED / CANCELLED / FAILED); permanent record for history, analytics, and billing. Not written during the active order lifecycle.
 >
-> Supabase **Realtime** (PostgreSQL logical replication → WebSocket) pushes **courier GPS position** to Customer App via `active_courier_positions` view. Order status is not delivered via Realtime — the Customer App polls `GET /api/v1/orders/{orderId}` instead.
+> Customer App polls `GET /api/v1/orders/{orderId}` every 5 seconds for order status.
 
 ### DynamoDB (high-throughput, active order state + append-only audit)
 ```
 active_orders        PK: orderId   (no SK)   full order state during active lifecycle
-                     ↳ All status transitions: waiting_payment → … → courier_assigned → picked_up → delivered
+                     ↳ All status transitions: pending → preparing → ready → courier_assigned → picked_up → delivered
                      ↳ expiresAt TTL: auto-deleted after terminal state is archived to Supabase
                      ↳ GSI_customer_orders   (PK: customerId,    SK: createdAt)
                      ↳ GSI_restaurant_orders (PK: restaurantId,  SK: status)
                      ↳ GSI_courier_orders    (PK: courierId,     SK: updatedAt)
-courier_locations    PK: courier_id   SK: timestamp   (lat, lng, order_id)
 order_events         PK: order_id     SK: event_time  (stage, actor_id)
-                     ↳ Immutable audit log: every order state transition (PENDING→CONFIRMED→READY→PICKED_UP→DELIVERED)
+                     ↳ Immutable audit log: every order state transition (PENDING→PREPARING→READY→PICKED_UP→DELIVERED)
                      ↳ actor_id: the user/system that triggered the event
-                       • restaurant_id when PENDING→CONFIRMED (restaurant accepts)
-                       • "SYSTEM" when CONFIRMED→PREPARING (auto-start after delay)
+                       • "SYSTEM" when PENDING→PREPARING (auto on payment confirmation)
                        • courier_id when READY→PICKED_UP (courier picks up food)
-                       • courier_id when PICKED_UP→ON_THE_WAY (courier en route)
-                       • customer_id when ON_THE_WAY→DELIVERED (customer confirms)
+                       • courier_id or customer_id when PICKED_UP→DELIVERED (both must confirm)
                      ↳ Why store here? Immutable event log for compliance, analytics, and debugging delivery issues
 ```
-> DynamoDB handles GPS writes (10K+ writes/min), active order state (all in-flight transitions), and the immutable event log — all append-only or single-item updates requiring single-digit ms latency.
+> DynamoDB handles active order state (all in-flight transitions) and the immutable event log — all append-only or single-item updates requiring single-digit ms latency.
 
-### MongoDB Atlas (caching + sessions — document store)
+### MongoDB Atlas (sessions — document store)
 ```
-Collection: catalog_cache    { restaurant_id, menu_items[], ttl: 5min }
 Collection: sessions         { user_id, jwt_meta, expires_at (TTL index) }
-                             ↳ Stores JWT metadata + session state for every authenticated user
+                             ↳ Stores JWT metadata + session state for Restaurant / Admin / Courier users (Cognito)
                              ↳ Why store here? Fast session lookup on every API request (avoid DB hits)
                              ↳ TTL index automatically deletes expired sessions (self-cleaning, no manual cleanup)
                              ↳ Example: on login, Cognito returns JWT → store jwt_meta in MongoDB for 1h
-                               (then subsequent API calls validate session locally before hitting Supabase)
-                             ↳ Replaces Redis sessions — no separate caching infrastructure needed
+                             ↳ Customer sessions are managed by NextAuth.js in HTTP-only cookies — not stored here
 ```
-> TTL indexes on MongoDB collections provide automatic expiry — equivalent to Redis TTL without a separate caching service. Change Streams can be used for lightweight pub/sub where sub-millisecond latency is not required.
+> TTL indexes on MongoDB collections provide automatic expiry — equivalent to Redis TTL without a separate caching service.
 
 ---
 
@@ -600,24 +586,22 @@ graph TB
     end
 
     subgraph Compute["Backend Compute"]
-        AG2[API Gateway] --> LMB[Lambda Functions\nper Microservice]
-        AG2 --> FG[Fargate Cluster\nDelivery Service\nWebSocket]
-        LMB --> SBD[(Supabase\nPostgreSQL + Realtime)]
+        AG2[API Gateway\nREST] --> LMB[Lambda Functions\nper Microservice (incl. Delivery Service)]
+        LMB --> SBD[(Supabase\nPostgreSQL)]
         LMB --> DYN[(DynamoDB\nOn-demand)]
-        LMB --> MDB2[(MongoDB Atlas\nCaching + Sessions)]
-        FG --> DYN
-        FG --> SBD
+        LMB --> MDB2[(MongoDB Atlas\nSessions)]
     end
 
     subgraph Messaging2["Async Messaging"]
-        LMB --> SNSFQ[SNS FIFO Topic\norder-events.fifo]
-        SNSFQ --> SQSQ[SQS FIFO Queues\nper consumer service]
-        SQSQ --> LMB
+        LMB --> SNSSTD[SNS Standard Topic\norder-events]
+        SNSSTD --> SQSSTD[SQS Standard Queues\nper consumer service]
+        SQSSTD --> LMB
         LMB --> SNSN[SNS Standard Topic\nSMS/Email/Push\nto end users]
     end
 
     subgraph Security2["Security"]
-        COG2[Cognito User Pool] --> AG2
+        COG2[Cognito User Pool\nRestaurant / Admin / Courier] --> AG2
+        NAUTH2[NextAuth.js\nCustomer sessions\nHTTP-only cookies] --> AG2
         SMG[Secrets Manager] --> LMB
         IAM[IAM Roles\nleast privilege] --> LMB
     end
@@ -629,7 +613,7 @@ graph TB
     end
 
     subgraph IaC["Infrastructure as Code"]
-        CFN[CloudFormation\nVPC, DynamoDB\nCognito, IAM, SQS FIFO]
+        CFN[CloudFormation\nVPC, DynamoDB\nCognito, IAM, SNS Standard, SQS Standard]
         SAM[SAM Templates\nLambda + API GW]
     end
 ```
@@ -639,8 +623,10 @@ graph TB
 ## 8. Security Design
 
 ```
-Authentication:  AWS Cognito → JWT (access token 1h, refresh token 30d)
-Authorization:   Role-based: CUSTOMER | RESTAURANT | SHOP | COURIER | ADMIN | OPS
+Authentication:
+  - Customers:                  NextAuth.js → HTTP-only cookie (session token, 30d)
+  - Restaurant / Admin / Courier: AWS Cognito → JWT (access token 1h, refresh token 30d)
+Authorization:   Role-based: CUSTOMER | RESTAURANT | COURIER | ADMIN
 Transport:       HTTPS only (CloudFront enforced)
 Secrets:         AWS Secrets Manager (DB creds, payment keys, API keys)
 Config:          Environment variables for non-sensitive (LOG_LEVEL, REGION)
@@ -667,8 +653,8 @@ sequenceDiagram
     participant SNS as SNS
     participant OD as Ops Dashboard
 
-    OS->>SQS: order.status.changed {orderId, stage, ts, MessageGroupId=orderId}
-    SQS->>MonSvc: consume event (FIFO, ordered) → write to DynamoDB order_events
+    OS->>SQS: order.status.changed {orderId, stage, ts}
+    SQS->>MonSvc: consume event → write to DynamoDB order_events
     
     Note over MonSvc: Runs every 5 min (EventBridge cron)
     MonSvc->>MonSvc: Check orders stuck in stage > SLA threshold
@@ -682,8 +668,8 @@ sequenceDiagram
 **SLA Thresholds (configurable per stage):**
 | Stage | SLA |
 |---|---|
-| PENDING → CONFIRMED | 5 min |
-| CONFIRMED → READY | 30 min |
+| PENDING → PREPARING | auto (< 30 sec, triggered by payment confirmation) |
+| PREPARING → READY | 30 min |
 | READY → PICKED_UP | 15 min |
 | PICKED_UP → DELIVERED | 60 min |
 
@@ -696,28 +682,27 @@ sequenceDiagram
 - **Scale:** Auto-scales to zero and to thousands. Handles lunch peak (12–14:00) automatically
 - **Ops:** No server management → 3 engineers focus on features, not infrastructure
 
-### Why Fargate for Delivery Service?
-- Delivery tracking needs **persistent WebSocket connections** (Lambda has 29-sec timeout)
-- Fargate allows long-lived containers without managing EC2 instances
+### Why Lambda for Delivery Service (MVP)?
+- The broadcast model (couriers poll REST for nearby orders) eliminates the need for persistent connections
+- Lambda is simpler to operate, costs zero when idle, and auto-scales for lunch peaks
+- Fargate can be reintroduced when real-time GPS tracking is needed at scale
 
 ### Why Supabase (instead of raw RDS)?
 - Same PostgreSQL under the hood — all relational, ACID-compliant guarantees
-- **Built-in Realtime**: courier GPS position pushes to Customer App via `active_courier_positions` view out-of-the-box (no extra Socket.io server needed)
 - **Auto-generated REST API**: reduces boilerplate in catalog/user services
 - **Managed service**: no RDS Multi-AZ setup, connection pooling (PgBouncer) is built-in
+- **JSONB support**: `menu_items.ai_generated`, `labels`, `nutrition` stored as JSONB — flexible schema for AI-generated content
 - **Cost**: Supabase Pro plan ($25/mo) vs RDS db.t3.medium Multi-AZ ($120–160/mo) → **saves ~$100–130/mo at MVP stage**
 
 ### Why DynamoDB?
-- Courier GPS updates = **10,000+ writes/min** at peak → DynamoDB handles this at single-digit milliseconds
 - Active order state = high-frequency status transitions across thousands of concurrent orders, all single-item writes with TTL auto-cleanup → perfect DynamoDB fit
 - Order events log = append-only, schema-less immutable audit trail → perfect DynamoDB fit
 
 ### Why MongoDB Atlas (instead of ElastiCache Redis)?
-- **TTL collections** replace Redis key expiry for catalog cache and sessions — no separate caching infrastructure
-- **Document model** fits catalog cache naturally (restaurant + full menu in one document)
+- **TTL collections** replace Redis key expiry for sessions — no separate caching infrastructure
+- **Document model** fits session data naturally
 - **Change Streams** provide lightweight pub/sub for cases where sub-millisecond latency is not needed
 - **Atlas Free Tier (M0)** for MVP → $0 until scale demands M10 ($57/mo)
-- **Limitation acknowledged**: MongoDB is NOT a drop-in replacement for Redis pub/sub at very high frequency. Courier GPS broadcast (every 10 sec, 2K couriers) is handled by **Supabase Realtime** (Postgres → WebSocket) instead — not MongoDB
 
 ### Why Next.js for Customer + React for dashboards/PWA?
 - Customer App gets SSR/SSG for SEO-critical discovery pages (landing, cuisine, restaurant)
@@ -734,33 +719,32 @@ sequenceDiagram
 - **Continuous KB update**: S3 upload triggers ingestion Lambda automatically — no manual steps
 - **OpenAI API** remains as a configurable fallback — useful when GPT-4o-mini quality is needed at minimal cost ($0.15/1M input)
 
-### Why SQS FIFO + SNS FIFO for order events?
-- **FIFO = ordering guaranteed per order**: `MessageGroupId = order_id` ensures CONFIRMED always processes before PREPARING, PREPARING before READY — critical for the state machine
-- **Exactly-once processing**: SQS FIFO deduplicates within a 5-minute window using `MessageDeduplicationId`
-- **SNS FIFO fan-out**: single `order-events.fifo` topic fans out to multiple SQS FIFO queues (one per consumer: Notification, Monitoring, Delivery) — all receive ordered events independently
-- **Standard SNS** is kept for final user notifications (SMS/email) since SNS FIFO cannot deliver to phone/email endpoints directly
-- **Throughput**: SQS FIFO supports 3,000 TPS with batching — more than sufficient for 100K users
-- **DLQ**: Dead Letter Queue on each SQS FIFO queue catches poison messages without blocking the queue
+### Why SNS Standard + SQS Standard for order events?
+- **Simpler at MVP scale**: Standard SNS/SQS is sufficient for 100K users — no FIFO queue 300 TPS limit, no MessageGroupId management
+- **Cost**: Standard SQS is ~10× cheaper than FIFO per million requests
+- **Fan-out**: single `order-events` SNS Standard topic fans out to multiple SQS Standard queues (one per consumer: Notification, Monitoring, Delivery) — all receive events independently
+- **Duplicate handling**: consumers check current order state before acting, handling rare duplicates gracefully
+- **DLQ**: Dead Letter Queue on each SQS Standard queue catches poison messages without blocking the queue
+- FIFO can be reintroduced when strict ordering or exactly-once semantics become critical at scale
 
 ### Total Monthly Cost Estimate (MVP scale, 100K users)
 | Component | Est. Cost/Month |
 |---|---|
-| Lambda (order/catalog/user) | $15–30 |
-| Fargate (2 tasks, delivery service) | $50–80 |
-| Supabase Pro (PostgreSQL + Realtime) | $25–50 |
+| Lambda (all services, incl. Delivery) | $15–35 |
+| Supabase Pro (PostgreSQL) | $25–50 |
 | DynamoDB (on-demand) | $20–50 |
 | MongoDB Atlas (M0 free → M10) | $0–57 |
 | API Gateway | $10–20 |
 | CloudFront + S3 | $10–20 |
-| SQS FIFO + SNS FIFO + SNS Standard | $5–12 |
+| SNS Standard + SQS Standard | $2–5 |
 | CloudWatch | $10–15 |
-| Cognito (first 50K MAU free) | $0–27 |
+| Cognito (Restaurant/Admin/Courier only — fewer MAU) | $0–10 |
 | **AI: AWS Bedrock LLM** (Nova Micro, ~1M tokens/mo) | $1–15 |
 | **AI: Bedrock Titan Embed v2** (ingestion + queries) | $1–5 |
 | **AI: OpenAI API** (optional, if admin switches) | $0–30 |
-| **TOTAL** | **~$147–465/mo** |
+| **TOTAL** | **~$94–312/mo** |
 
-> **vs optional stack**: Replacing RDS Multi-AZ ($120–160) with Supabase Pro ($25–50) and ElastiCache Redis ($25–40) with MongoDB Atlas Free Tier ($0) saves **$100–175/mo** at MVP stage. AI adds only **$2–50/mo** at MVP usage levels — pgvector reuses existing Supabase Pro plan at no extra cost.
+> **vs optional stack**: Replacing RDS Multi-AZ ($120–160) with Supabase Pro ($25–50) and ElastiCache Redis ($25–40) with MongoDB Atlas Free Tier ($0) saves **$100–175/mo** at MVP stage. Moving Delivery Service from Fargate ($50–80) to Lambda ($0 when idle) further reduces costs. AI adds only **$2–50/mo** at MVP usage levels — pgvector reuses existing Supabase Pro plan at no extra cost.
 
 ---
 
@@ -777,21 +761,21 @@ sequenceDiagram
 
 | Day | Engineer A | Engineer B | Engineer C |
 |---|---|---|---|
-| **1** | AWS setup: Cognito, DynamoDB, SQS FIFO queues + SNS FIFO topic, Supabase project init | AWS setup: Fargate cluster, API Gateway, MongoDB Atlas cluster, CloudFormation templates | Project scaffold: 1 Next.js app (Customer) + 3 React apps, CloudFront pipeline, routing |
-| **2** | User Service: register, login, JWT, roles (Lambda + Supabase) | Catalog Service: restaurants/menus CRUD (Lambda + Supabase) | Customer App: Login page, JWT storage, protected routes |
-| **3** | Order Service: create order, state machine (PENDING→CONFIRMED→PREPARING) | Catalog Service: product images (S3), search/filter endpoints | Restaurant Dashboard: Login, order queue (polling), order accept/reject |
-| **4** | Order Service: full state machine + SQS event publishing | Delivery Service: Fargate container, WebSocket, courier assignment | Customer App: Browse, cart, order placement flow |
-| **5** | Payment Service: Stripe/payment intent Lambda, confirm/refund | Notification Service: SNS fan-out (Email+SMS), push skeleton | Restaurant Dashboard: Menu management CRUD |
+| **1** | AWS setup: Cognito (staff), DynamoDB, SQS Standard queues + SNS Standard topics, Supabase project init | AWS setup: API Gateway, MongoDB Atlas cluster, CloudFormation templates | Project scaffold: 1 Next.js app (Customer) + 3 React apps, CloudFront pipeline, routing |
+| **2** | User Service: register, login, JWT + NextAuth.js (Customer), roles (Lambda + Supabase) | Catalog Service: restaurants/menus CRUD (Lambda + Supabase, JSON fields) | Customer App: Login page (NextAuth.js), protected routes |
+| **3** | Order Service: create order, state machine (PENDING→PREPARING auto on payment) | Catalog Service: product images (S3), search/filter, AI dish card endpoint (Bedrock) | Restaurant Dashboard: Login, order queue (polling), mark READY |
+| **4** | Order Service: full state machine + SNS Standard event publishing | Delivery Service: Lambda, broadcast model, proximity query, courier assignment | Customer App: Browse, cart, order placement flow |
+| **5** | Payment Service: Stripe/payment intent Lambda, confirm/refund | Notification Service: SNS fan-out (Email+SMS), push skeleton | Restaurant Dashboard: Menu management CRUD + AI helper UI |
 
 ### Week 2 — Tracking, Monitoring, Polish, Deploy
 
 | Day | Engineer A | Engineer B | Engineer C |
 |---|---|---|---|
-| **8** | Monitoring Service: scheduled Lambda, SLA checks, CloudWatch alarms | Delivery Service: GPS tracking → DynamoDB, Supabase Realtime broadcast to clients | Courier App: Login, task list, accept delivery, stage updates |
-| **9** | Monitoring Service: alert polling endpoint (`GET /alerts`) | Analytics Service: daily orders report, restaurant stats | Customer App: Live order tracking (WebSocket), order history |
-| **10** | Auth: Cognito integration polish, token refresh, RBAC middleware | Notification Service: full integration — every stage triggers correct notification | Ops Dashboard: Alert inbox (30s poll), all-orders board, SLA indicator |
-| **11** | End-to-end testing: full order flow Customer→Restaurant→Courier→Delivered | End-to-end testing: notifications, delivery tracking, analytics | Ops Dashboard: Courier live map (positions from Supabase Realtime), admin user management |
-| **12** | SAM templates: all Lambdas + API Gateway deployment | CloudFormation: full infra stack (DynamoDB, SQS FIFO, SNS FIFO, Cognito, IAM) | Cross-browser testing, mobile layout polish, environment configs |
+| **8** | Monitoring Service: scheduled Lambda, SLA checks, CloudWatch alarms | Delivery Service: courier location REST endpoint (`PATCH /location`), proximity query, confirm-delivery endpoints | Courier App: Login, available orders list (broadcast model), accept + stage updates |
+| **9** | Monitoring Service: alert polling endpoint (`GET /alerts`) | Analytics Service: daily orders report, restaurant stats | Customer App: Live order tracking (polling), confirm-delivery UI, order history |
+| **10** | Auth: Cognito + NextAuth.js integration polish, token refresh, RBAC middleware | Notification Service: full integration — every stage triggers correct notification | Ops Dashboard: Alert inbox (30s poll), all-orders board, SLA indicator |
+| **11** | End-to-end testing: full order flow Customer→Restaurant→Courier→Delivered | End-to-end testing: notifications, delivery tracking, analytics | Ops Dashboard: Courier last-known position map, admin user management |
+| **12** | SAM templates: all Lambdas + API Gateway deployment | CloudFormation: full infra stack (DynamoDB, SNS Standard, SQS Standard, Cognito, IAM) | Cross-browser testing, mobile layout polish, environment configs |
 | **13** | Integration testing, bug fixes, secrets config (Secrets Manager) | Load test: SQS throughput, DynamoDB GPS writes | CI/CD pipeline (GitHub Actions → S3 + Lambda deploy) |
 | **14** | **MVP Demo Prep + Documentation** | **MVP Demo Prep + Documentation** | **MVP Demo Prep + Staging Deploy** |
 
@@ -800,11 +784,11 @@ sequenceDiagram
 ### Deliverables After 2 Weeks
 - [ ] Customer app (Next.js) + 3 React apps deployed via CloudFront
 - [ ] 7 Lambda microservices deployed (SAM)
-- [ ] Delivery service on Fargate (WebSocket live tracking)
+- [ ] Delivery service on Lambda (REST broadcast model, proximity assignment)
 - [ ] Full order lifecycle (PENDING → DELIVERED) working end-to-end
 - [ ] Monitoring dashboard with real-time alerts
 - [ ] CloudFormation IaC for full infrastructure
-- [ ] Cognito Auth + RBAC for all roles
+- [ ] Cognito Auth (Restaurant/Admin/Courier) + NextAuth.js (Customer) + RBAC
 - [ ] Notification (Email + SMS) on every stage
 - [ ] CI/CD pipeline for automated deployment
 - [ ] AI Chat widget functional in Customer App only (Bedrock default model)
@@ -818,14 +802,14 @@ sequenceDiagram
 ```
 food-delivery/
 ├── infrastructure/
-│   ├── cloudformation/       # VPC, DynamoDB, SQS FIFO, SNS FIFO, Cognito stacks
+│   ├── cloudformation/       # VPC, DynamoDB, SNS Standard, SQS Standard, Cognito stacks
 │   └── sam/                  # SAM templates per Lambda service
 │
 ├── services/
 │   ├── user-service/         # Node.js Lambda
 │   ├── catalog-service/      # Node.js Lambda
 │   ├── order-service/        # Node.js Lambda
-│   ├── delivery-service/     # Node.js Fargate (Express + ws)
+│   ├── delivery-service/     # Node.js Lambda (REST broadcast model)
 │   ├── payment-service/      # Node.js Lambda
 │   ├── notification-service/ # Node.js Lambda
 │   ├── monitoring-service/   # Node.js Scheduled Lambda
@@ -841,7 +825,7 @@ food-delivery/
 │
 └── shared/
     ├── types/                # Shared TypeScript types
-    ├── events/               # SQS event schemas
+    ├── events/               # SNS/SQS event schemas
     ├── middleware/           # JWT validation, error handler
     └── ai/                   # Bedrock/OpenAI client wrappers, prompt templates
 ```
@@ -1029,10 +1013,10 @@ The Order Service Lambda is orchestrated by an **AWS Step Functions Express Work
 
 Key design decisions:
 
-- **`WaitForTaskToken` at payment and restaurant confirmation steps** — the state machine pauses and issues a callback token to the external actor (Stripe webhook → Payment Service, restaurant dashboard → Order Service API). This costs zero Lambda-seconds while waiting, versus a polling loop that would burn continuous invocations.
-- **Per-order `MessageGroupId`** on every SNS FIFO publish ensures downstream services (Delivery, Notification, Monitoring) receive events in strict causal order: `PENDING → CONFIRMED → PREPARING → READY`.
-- **Three distinct `CANCELLED` terminal paths** (validation failure, payment failure, restaurant rejection/timeout) each trigger a shared refund flow via the Payment Service before terminating.
-- **Idempotency** is enforced via the DynamoDB `idempotency_records` table using `order_id` as the deduplication key, so retries on transient DB errors never create duplicate orders.
+- **`WaitForTaskToken` at payment step** — the state machine pauses and issues a callback token to the external actor (Stripe webhook → Payment Service). This costs zero Lambda-seconds while waiting, versus a polling loop that would burn continuous invocations.
+- **Automatic PREPARING transition**: upon payment confirmation, status transitions automatically to `PREPARING` — no restaurant action required. This eliminates the 5-minute restaurant confirmation SLA and simplifies the critical path.
+- **Two `CANCELLED` terminal paths** (validation failure, payment failure) each trigger a shared refund flow via the Payment Service before terminating.
+- Events published to SNS Standard topic. Consumers check current order state before acting.
 
 ### 14.2 State Machine Diagram
 
@@ -1060,27 +1044,19 @@ flowchart TD
     WPAY -->|confirmed| PUB1
     WPAY -->|failed / timeout| CX2
 
-    PUB1["**Publish order.created** _(SNS FIFO)_\nMessageGroupId = order_id"]
-    PUB1 --> WREST
+    PUB1["**Publish order.preparing** _(SNS Standard)_\n→ Delivery · Notification · Monitoring"]
+    PUB1 --> ADV
 
-    WREST["**Wait for restaurant** _(WaitForTaskToken)_\nPENDING → CONFIRMED · 5 min SLA"]
-    WREST -->|confirmed| PUB2
-    WREST -->|rejected / timeout| CX3
-
-    PUB2["**Publish order.confirmed** _(SNS FIFO)_\n→ Delivery · Notification · Monitoring"]
-    PUB2 --> ADV
-
-    ADV["**Advance status** _(Lambda task)_\nCONFIRMED → PREPARING → READY"]
+    ADV["**Advance status** _(Lambda task)_\nPENDING → PREPARING (automatic)"]
     ADV --> END
 
-    END([Hand off → Delivery Service Fargate])
+    END([Hand off → Delivery Service Lambda])
     END --> ARCH
 
     CX1(["CANCELLED\nInvalid order"])
     CX2(["CANCELLED\nPayment failed"])
-    CX3(["CANCELLED\nRejected / timeout"])
 
-    CX1 & CX2 & CX3 --> REF["Trigger refund\n_(Payment Service)_"]
+    CX1 & CX2 --> REF["Trigger refund\n_(Payment Service)_"]
     REF --> ARCH["**Archive to Supabase** _(Lambda task)_\norders + order_items written on terminal state"]
     ARCH --> TERM([End])
 
@@ -1089,14 +1065,11 @@ flowchart TD
     style PAY    fill:#D8D0F8,stroke:#7F77DD,color:#3C3489
     style ADV    fill:#D8D0F8,stroke:#7F77DD,color:#3C3489
     style WPAY   fill:#C5EAD8,stroke:#1D9E75,color:#085041
-    style WREST  fill:#C5EAD8,stroke:#1D9E75,color:#085041
     style PUB1   fill:#FAD8A0,stroke:#BA7517,color:#633806
-    style PUB2   fill:#FAD8A0,stroke:#BA7517,color:#633806
     style REF    fill:#FAD8A0,stroke:#BA7517,color:#633806
     style ARCH   fill:#FAD8A0,stroke:#BA7517,color:#633806
     style CX1    fill:#E8E6E4,stroke:#888780,color:#2C2C2A
     style CX2    fill:#E8E6E4,stroke:#888780,color:#2C2C2A
-    style CX3    fill:#E8E6E4,stroke:#888780,color:#2C2C2A
 ```
 
 **Node legend:**
@@ -1104,9 +1077,9 @@ flowchart TD
 | Color | Type | Examples |
 |---|---|---|
 | Purple | Lambda task | Validate, Create order, Advance status |
-| Green | Wait / Choice (WaitForTaskToken) | Wait for payment, Wait for restaurant |
-| Amber | SNS FIFO publish / Lambda archive | order.created, order.confirmed, Archive to Supabase |
-| Gray | Terminal state | CANCELLED × 3, End |
+| Green | Wait / Choice (WaitForTaskToken) | Wait for payment |
+| Amber | SNS Standard publish / Lambda archive | order.preparing, Archive to Supabase |
+| Gray | Terminal state | CANCELLED × 2, End |
 
 ### 14.3 State Timeouts & Retry Policy
 
@@ -1115,22 +1088,23 @@ flowchart TD
 | Validate order | 5 sec | 3× exponential (1s, 2s, 4s) | → CANCELLED (invalid) |
 | Create payment intent | 30 sec | 3× exponential | → CANCELLED (payment) |
 | Wait for payment | 10 min | N/A (external callback) | → CANCELLED (payment) |
-| Wait for restaurant | 5 min | N/A (external callback) | → CANCELLED (rejected) |
-| Publish SNS FIFO | 10 sec | 3× exponential | Step Functions retries, DLQ on exhaustion |
+| Publish SNS Standard | 10 sec | 3× exponential | Step Functions retries, DLQ on exhaustion |
 | Advance status | 15 sec | 3× exponential | CloudWatch alarm, manual retry via ops |
 | Archive to Supabase | 15 sec | 3× exponential | DLQ + CloudWatch alarm for manual retry |
 
 ---
 
-## 15. Delivery Service — Fargate Architecture
+## 15. Delivery Service — Lambda Architecture
 
-### 15.1 Why Fargate
+### 15.1 Why Lambda
 
-The Delivery Service is the only backend component running on Fargate rather than Lambda. Three hard constraints force this choice:
+For the MVP, the Delivery Service runs on Lambda rather than Fargate:
 
-1. **Persistent WebSocket connections** — couriers push GPS every 10 seconds across up to 2,000 concurrent connections. Lambda's maximum 29-second execution timeout cannot support long-lived connections at this scale.
-2. **Stateful in-memory routing** — the Assignment Engine keeps a small in-process map of `courier_id → current_order` to avoid a database round-trip on every GPS event. Lambda's stateless cold-start model makes this prohibitively expensive.
-3. **Graceful shutdown with active deliveries** — on ECS task termination (SIGTERM), the service must flush in-flight GPS writes to DynamoDB and reassign any active couriers before exiting. A 30-second grace period is required; Lambda does not support this.
+1. **No persistent connections needed** — the broadcast model eliminates WebSocket requirements. Couriers poll `GET /deliveries/available?lat&lng&radius` to see nearby orders. No stateful in-memory routing is needed.
+2. **Simpler to operate** — Lambda costs zero when idle, auto-scales for lunch peaks, and requires no ECS cluster management.
+3. **Sufficient timeout** — all delivery REST operations complete well within Lambda's 30-second timeout.
+
+Fargate is documented as a future migration path when real-time GPS tracking and sub-second push are needed at scale.
 
 ### 15.2 Internal Module Diagram
 
@@ -1144,80 +1118,69 @@ config:
 graph TB
     subgraph External["External actors"]
         CA[Courier App PWA]
-        ECS[ECS health check]
+        CU[Customer App]
+        APIGW[API Gateway health check]
     end
 
-    subgraph Fargate["Delivery Service — Fargate container (Node.js / Express + ws)"]
-        WS["WebSocket server\nws + Express · port 8080"]
-        AE["Assignment engine\nNearest available courier"]
-        GPS["GPS tracker\n10 sec interval · buffer writes"]
-        SM["Stage state machine\nPICKED_UP → ON_WAY → DELIVERED"]
-        SQS_C["SQS FIFO consumer\norder.confirmed · order.status.*"]
-        RT["Supabase courier-position bridge\nGPS write → active_courier_positions"]
-        HC["GET /health\nECS health check · 200 OK"]
-        GS["Graceful shutdown\nSIGTERM → flush GPS · close WS\nReassign via Lambda (2 min)"]
+    subgraph Lambda["Delivery Service — Lambda (Node.js)"]
+        BE["Broadcast engine\nGET /deliveries/available?lat&lng&radius"]
+        AE["Assignment engine\nFirst-writer wins — conditional write"]
+        SM["Stage state machine\nPICKED_UP → DELIVERED"]
+        SQS_C["SQS Standard consumer\norder.preparing · order.cancelled · order.status.ready"]
+        REST["REST handler\nAPI Gateway routes"]
+        HC["GET /health\nLambda health check · 200 OK"]
     end
 
     subgraph DataStores["Data stores"]
-        DY[(DynamoDB\nactive_orders · courier_states\ncourier_locations · order_events)]
-        SB[(Supabase PostgreSQL\nassignments · couriers\nactive_courier_positions)]
+        DY[(DynamoDB\nactive_orders · courier_states · order_events)]
+        SB[(Supabase PostgreSQL\nassignments · couriers)]
     end
 
     subgraph Messaging["Messaging"]
-        SQSQ[SQS FIFO queue\ndelivery-events.fifo\nDLQ after 3 failures]
-        SNS_OUT[SNS FIFO topic\norder.status.* published out]
-        CW[CloudWatch\nWS connections · GPS lag · assignment lag]
+        SQSQ[SQS Standard queue\ndelivery-events\nDLQ after 3 failures]
+        SNS_OUT[SNS Standard topic\norder-events]
+        CW[CloudWatch\nassignment lag · unaccepted orders · stage errors]
     end
 
-    CA -->|GPS push every 10s| WS
-    WS --> GPS
-    WS --> SM
+    CA -->|GET /deliveries/available| BE
+    CA -->|POST /deliveries/{id}/accept| AE
+    CA -->|POST /deliveries/{id}/stage\nPATCH /couriers/{id}/location| SM
+    CU -->|POST /deliveries/{id}/confirm-delivery| SM
     SQS_C --> AE
-    AE -->|Read available couriers| SB
+    AE -->|Read courier_states| DY
+    AE -->|Write assignments| SB
     AE --> SM
-    GPS -->|Batch writes| DY
     SM -->|Write order_events| DY
     SM -->|Update assignments| SB
     SM --> SNS_OUT
-    GPS --> RT
-    RT -->|GPS position upsert| SB
     SQSQ -->|Pull events| SQS_C
-    ECS -->|Poll /health| HC
-    Fargate -->|Metrics| CW
+    APIGW -->|Poll /health| HC
+    Lambda -->|Metrics| CW
 ```
 
 ### 15.3 Module Responsibilities
 
 | Module | Responsibility | Trigger |
 |---|---|---|
-| **WebSocket server** | Accepts persistent connections from couriers and (indirectly) customer apps; routes inbound GPS frames to GPS Tracker and stage commands to Stage State Machine | New WS connection on port 8080 |
-| **Assignment engine** | On `order.confirmed` event, queries Supabase for the nearest available courier, writes to `assignments`, notifies courier via WS | SQS FIFO consumer delivers `order.confirmed` |
-| **GPS tracker** | Buffers GPS frames from couriers (10 sec cadence, 2,000 couriers = ~200 writes/sec peak), batch-writes to DynamoDB `courier_locations` | Courier WS message |
-| **Stage state machine** | Authoritative source for `PICKED_UP → ON_THE_WAY → DELIVERED` transitions; each transition writes to DynamoDB `order_events`, updates Supabase `assignments`, and publishes to SNS FIFO | Courier stage-update WS message |
-| **SQS FIFO consumer** | Long-polls `delivery-events.fifo`; routes `order.confirmed` to Assignment Engine and other order events to Stage State Machine | SQS FIFO queue |
-| **Supabase courier-position bridge** | On each GPS batch write, upserts `active_courier_positions` in Supabase; Supabase Realtime (PostgreSQL logical replication → WebSocket) fans out courier GPS position to subscribed Customer App instances. Order status is no longer pushed via Realtime — Customer App polls `GET /api/v1/orders/{orderId}` instead | GPS tracker batch write |
-| **GET /health** | Returns `200 OK` when all internal modules are initialised; used by ECS target group health check to gate traffic | ECS health check (every 30 sec) |
-| **Graceful shutdown** | On SIGTERM: stops accepting new WS connections, flushes GPS write buffer to DynamoDB, closes active WS connections, invokes reassignment Lambda for any in-progress deliveries | ECS task termination (SIGTERM) |
+| **Broadcast engine** | Returns list of available orders within `radius` km of courier's current position; reads `active_orders` in DynamoDB with `status = preparing` | Courier `GET /deliveries/available` |
+| **Assignment engine** | On `order.preparing` event, stores order as broadcast-ready; on courier accept, performs conditional DynamoDB write — first writer wins; 409 if already assigned | SQS Standard consumer delivers `order.preparing`; Courier `POST /accept` |
+| **Stage state machine** | Authoritative source for `PICKED_UP → DELIVERED` transitions; each transition writes to DynamoDB `order_events`, updates Supabase `assignments`, and publishes to SNS Standard. Delivery confirmed when both courier and customer tap confirm — no photo required | Courier `POST /stage`; Customer `POST /confirm-delivery` |
+| **SQS Standard consumer** | Polls `delivery-events` queue; routes `order.preparing` to Assignment Engine and other events to Stage State Machine | SQS Standard queue |
+| **REST handler** | API Gateway routes: `GET /deliveries/available`, `POST /accept`, `POST /stage`, `PATCH /couriers/{id}/location`, `POST /confirm-delivery`, `GET /deliveries/{orderId}` | API Gateway HTTP request |
+| **GET /health** | Returns `200 OK` when all internal modules are ready; used by API Gateway health check | API Gateway health check |
 
 ### 15.4 Scaling & Resilience
 
-**ECS auto-scaling** uses CPU target tracking (threshold: 70%):
+**Lambda auto-scaling:** Lambda scales automatically. Concurrency limit: 200. At MVP scale (100K users, lunch peak), order event rate is well within Lambda concurrency limits — no manual scaling configuration required.
 
-| Time | Task count | Driver |
-|---|---|---|
-| Off-peak | 2 tasks | Baseline minimum |
-| Lunch peak (12–14:00) | Up to 10 tasks | CPU > 70% for 3 consecutive minutes |
-| Scale-in | Back to 2 | CPU < 50% for 15 minutes (cooldown) |
+**DLQ:** The SQS Standard consumer queue (`delivery-events`) has a Dead Letter Queue. Messages that fail processing more than 3 times are moved to the DLQ and trigger a CloudWatch alarm to the ops team — they never block the queue.
 
-**Connection draining:** When ECS terminates a task, it deregisters the task from the load balancer target group with a 30-second connection-draining window. The graceful shutdown handler inside the container uses this window to complete in-flight GPS writes and trigger courier reassignment via an async Lambda invocation.
-
-**DLQ:** The SQS FIFO consumer queue (`delivery-events.fifo`) has a Dead Letter Queue. Messages that fail processing more than 3 times are moved to the DLQ and trigger a CloudWatch alarm to the ops team — they never block the queue.
+**Race condition handling:** Courier assignment uses a DynamoDB conditional write. If two couriers attempt to accept the same order simultaneously, only the first write succeeds; the second receives a 409 Conflict response.
 
 **CloudWatch key metrics for Delivery Service:**
 
 | Metric | Alert threshold |
 |---|---|
-| WebSocket connection count | Drop > 10% in 5 min |
-| GPS update lag (DynamoDB write delay) | > 20 seconds |
-| Courier assignment lag (order.confirmed → courier notified) | > 30 seconds |
-| Active task count below minimum | < 2 tasks for > 2 min |
+| Courier assignment lag (order.preparing → courier accepted) | > 60 seconds |
+| Unaccepted orders count | > 5 unaccepted for > 5 min |
+| Stage transition errors | > 5 errors / 5 min |
