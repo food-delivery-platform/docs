@@ -1,6 +1,6 @@
 # Food Delivery Platform — High Level Architecture (HLA) + MVP Plan
 
-**Scale:** ~100,000 users | 300 restaurants | 10,000 shops | 2,000 couriers  
+**Scale:** ~100,000 users | 300 restaurants | 2,000 couriers  
 **Stack:** Next.js (Customer Web) + React (Ops apps) · Node.js/FastAPI · AWS Lambda · Supabase (PostgreSQL + pgvector) · DynamoDB · MongoDB Atlas · AWS (Cognito, SQS FIFO, SNS FIFO, Bedrock, CloudWatch, Fargate, S3/CloudFront) · OpenAI API (optional)
 
 ---
@@ -183,7 +183,7 @@ style OrderServiceStack fill:transparent,stroke:transparent,color:transparent
 - Browse restaurants & shops (search, filter, category)
 - Product catalog & cart
 - Order placement & payment
-- **Live order tracking** (WebSocket — real-time stage updates)
+- **Live order tracking** (polling `GET /api/v1/orders/{orderId}` every 5 seconds — reads DynamoDB `active_orders`)
 - Order history
 - Profile & addresses
 - **AI Chat widget** — floating assistant: order status Q&A, allergen/dietary queries, menu recommendations, support
@@ -354,14 +354,15 @@ Each consumer (DS, NS, MS) operates independently without blocking others. Failu
 ### 4.5 Data Consistency & Transaction Handling
 
 #### Strong Consistency (ACID) — Core Transactional Data
-- **Supabase PostgreSQL**: users, orders, restaurants, menu_items
+- **DynamoDB `active_orders`**: all in-flight order state — strong consistency within a single item write (`PutItem` / `UpdateItem`)
+- **Supabase PostgreSQL**: users, restaurants, menu_items, and archived orders written once on terminal state (DELIVERED / CANCELLED / FAILED), then immutable
 - Single-database ACID transactions within a service (no cross-service distributed transactions)
-- Example: Order creation is atomic — either the entire order + order_items are created, or nothing
+- Example: Order creation is atomic — a single DynamoDB `PutItem` issues the `orderId` and sets `PENDING` status
 
 #### Eventual Consistency — Event-Driven Updates
-- **Order status propagation**: Order Service writes to Supabase → publishes event → Monitoring/Notification services consume
-- Clients may see stale order status for < 1 second before SNS FIFO delivery
-- **Acceptable trade-off**: Real-time tracking is via Supabase Realtime (webhook), not polling
+- **Order status propagation**: Order Service writes status transitions to DynamoDB `active_orders` → publishes SNS FIFO events → Monitoring/Notification services consume; on terminal state, archives full order to Supabase PostgreSQL
+- Clients may see stale order status for up to 5 seconds (polling interval)
+- **Acceptable trade-off**: Customer App polls `GET /api/v1/orders/{orderId}` for order status; GPS courier position is still pushed via Supabase Realtime
 
 #### No Distributed Transactions
 - **Why?** Synchronous 2PC across services is slow and brittle. Instead:
@@ -402,8 +403,8 @@ Each consumer (DS, NS, MS) operates independently without blocking others. Failu
 
 | Service | Owned Tables | External Dependencies |
 |---|---|---|
-| Order Service | `orders`, `order_items`, `order_status_history` | Reads: `menu_items`, `restaurants`, `payments` (via REST, cached) |
-| Delivery Service | `assignments`, `courier_locations` (→ DynamoDB) | Reads: `orders`, `couriers` (via REST/cache) |
+| Order Service | `active_orders` (DynamoDB — live state); `orders`, `order_items` (Supabase — archive on terminal state) | Reads: `menu_items`, `restaurants`, `payments` (via REST, cached) |
+| Delivery Service | `assignments`, `courier_states`, `courier_locations`, `order_events` (→ DynamoDB) | Reads: `active_orders`, `couriers` (via REST/cache) |
 | Payment Service | `payments` | Reads: `orders` (via REST); writes event to SNS |
 | Notification Service | `notification_log` (audit only) | Reads: `orders`, `users` (via REST) |
 | User Service | `users`, `addresses`, `profiles` | N/A |
@@ -535,20 +536,26 @@ stateDiagram-v2
 
 ## 6. Data Layer Design
 
-### Supabase (PostgreSQL + Realtime — structured relational data)
+### Supabase (PostgreSQL + Realtime — permanent record store)
 ```
 users            (id, email, phone, role, cognito_sub, created_at)
 restaurants      (id, name, owner_id, address, is_open, rating)
 menu_items       (id, restaurant_id, name, price, category, image_url)
-orders           (id, customer_id, restaurant_id, status, total, created_at)
-order_items      (id, order_id, menu_item_id, qty, price)
 couriers         (id, user_id, vehicle_type, is_available)
 payments         (id, order_id, provider_ref, status, amount)
 ```
-> Supabase **Realtime** (PostgreSQL logical replication → WebSocket) pushes order status changes directly to subscribed clients — replaces a custom WebSocket layer for order tracking.
+> `orders` / `order_items` — written **once** on terminal state (DELIVERED / CANCELLED / FAILED); permanent record for history, analytics, and billing. Not written during the active order lifecycle.
+>
+> Supabase **Realtime** (PostgreSQL logical replication → WebSocket) pushes **courier GPS position** to Customer App via `active_courier_positions` view. Order status is not delivered via Realtime — the Customer App polls `GET /api/v1/orders/{orderId}` instead.
 
-### DynamoDB (high-throughput append-only data)
+### DynamoDB (high-throughput, active order state + append-only audit)
 ```
+active_orders        PK: orderId   (no SK)   full order state during active lifecycle
+                     ↳ All status transitions: waiting_payment → … → courier_assigned → picked_up → delivered
+                     ↳ expiresAt TTL: auto-deleted after terminal state is archived to Supabase
+                     ↳ GSI_customer_orders   (PK: customerId,    SK: createdAt)
+                     ↳ GSI_restaurant_orders (PK: restaurantId,  SK: status)
+                     ↳ GSI_courier_orders    (PK: courierId,     SK: updatedAt)
 courier_locations    PK: courier_id   SK: timestamp   (lat, lng, order_id)
 order_events         PK: order_id     SK: event_time  (stage, actor_id)
                      ↳ Immutable audit log: every order state transition (PENDING→CONFIRMED→READY→PICKED_UP→DELIVERED)
@@ -560,7 +567,7 @@ order_events         PK: order_id     SK: event_time  (stage, actor_id)
                        • customer_id when ON_THE_WAY→DELIVERED (customer confirms)
                      ↳ Why store here? Immutable event log for compliance, analytics, and debugging delivery issues
 ```
-> DynamoDB is kept only for GPS writes (10K+ writes/min) and the immutable event log — both are append-only, schema-less, and require single-digit ms writes.
+> DynamoDB handles GPS writes (10K+ writes/min), active order state (all in-flight transitions), and the immutable event log — all append-only or single-item updates requiring single-digit ms latency.
 
 ### MongoDB Atlas (caching + sessions — document store)
 ```
@@ -572,7 +579,6 @@ Collection: sessions         { user_id, jwt_meta, expires_at (TTL index) }
                              ↳ Example: on login, Cognito returns JWT → store jwt_meta in MongoDB for 1h
                                (then subsequent API calls validate session locally before hitting Supabase)
                              ↳ Replaces Redis sessions — no separate caching infrastructure needed
-Collection: active_orders    { order_id, status, last_updated, courier_pos }
 ```
 > TTL indexes on MongoDB collections provide automatic expiry — equivalent to Redis TTL without a separate caching service. Change Streams can be used for lightweight pub/sub where sub-millisecond latency is not required.
 
@@ -696,14 +702,15 @@ sequenceDiagram
 
 ### Why Supabase (instead of raw RDS)?
 - Same PostgreSQL under the hood — all relational, ACID-compliant guarantees
-- **Built-in Realtime**: order status changes push to clients via WebSocket out-of-the-box (no extra Socket.io server needed)
+- **Built-in Realtime**: courier GPS position pushes to Customer App via `active_courier_positions` view out-of-the-box (no extra Socket.io server needed)
 - **Auto-generated REST API**: reduces boilerplate in catalog/user services
 - **Managed service**: no RDS Multi-AZ setup, connection pooling (PgBouncer) is built-in
 - **Cost**: Supabase Pro plan ($25/mo) vs RDS db.t3.medium Multi-AZ ($120–160/mo) → **saves ~$100–130/mo at MVP stage**
 
 ### Why DynamoDB?
 - Courier GPS updates = **10,000+ writes/min** at peak → DynamoDB handles this at single-digit milliseconds
-- Order events log = append-only, schema-less → perfect DynamoDB fit
+- Active order state = high-frequency status transitions across thousands of concurrent orders, all single-item writes with TTL auto-cleanup → perfect DynamoDB fit
+- Order events log = append-only, schema-less immutable audit trail → perfect DynamoDB fit
 
 ### Why MongoDB Atlas (instead of ElastiCache Redis)?
 - **TTL collections** replace Redis key expiry for catalog cache and sessions — no separate caching infrastructure
@@ -1025,7 +1032,7 @@ Key design decisions:
 - **`WaitForTaskToken` at payment and restaurant confirmation steps** — the state machine pauses and issues a callback token to the external actor (Stripe webhook → Payment Service, restaurant dashboard → Order Service API). This costs zero Lambda-seconds while waiting, versus a polling loop that would burn continuous invocations.
 - **Per-order `MessageGroupId`** on every SNS FIFO publish ensures downstream services (Delivery, Notification, Monitoring) receive events in strict causal order: `PENDING → CONFIRMED → PREPARING → READY`.
 - **Three distinct `CANCELLED` terminal paths** (validation failure, payment failure, restaurant rejection/timeout) each trigger a shared refund flow via the Payment Service before terminating.
-- **Idempotency** is enforced at the `Create order in Supabase` step using `order_id` as the deduplication key, so retries on transient DB errors never create duplicate orders.
+- **Idempotency** is enforced via the DynamoDB `idempotency_records` table using `order_id` as the deduplication key, so retries on transient DB errors never create duplicate orders.
 
 ### 14.2 State Machine Diagram
 
@@ -1043,7 +1050,7 @@ flowchart TD
     VAL -->|valid| CRE
     VAL -->|invalid| CX1
 
-    CRE["**Create order in Supabase** _(Lambda task)_\nPENDING status · order_id issued"]
+    CRE["**Create order in DynamoDB** _(Lambda task)_\nPENDING status · order_id issued · active_orders table"]
     CRE --> PAY
 
     PAY["**Create payment intent** _(Lambda task)_\nStripe · idempotency_key = order_id"]
@@ -1067,13 +1074,15 @@ flowchart TD
     ADV --> END
 
     END([Hand off → Delivery Service Fargate])
+    END --> ARCH
 
     CX1(["CANCELLED\nInvalid order"])
     CX2(["CANCELLED\nPayment failed"])
     CX3(["CANCELLED\nRejected / timeout"])
 
     CX1 & CX2 & CX3 --> REF["Trigger refund\n_(Payment Service)_"]
-    REF --> TERM([End])
+    REF --> ARCH["**Archive to Supabase** _(Lambda task)_\norders + order_items written on terminal state"]
+    ARCH --> TERM([End])
 
     style VAL    fill:#D8D0F8,stroke:#7F77DD,color:#3C3489
     style CRE    fill:#D8D0F8,stroke:#7F77DD,color:#3C3489
@@ -1084,6 +1093,7 @@ flowchart TD
     style PUB1   fill:#FAD8A0,stroke:#BA7517,color:#633806
     style PUB2   fill:#FAD8A0,stroke:#BA7517,color:#633806
     style REF    fill:#FAD8A0,stroke:#BA7517,color:#633806
+    style ARCH   fill:#FAD8A0,stroke:#BA7517,color:#633806
     style CX1    fill:#E8E6E4,stroke:#888780,color:#2C2C2A
     style CX2    fill:#E8E6E4,stroke:#888780,color:#2C2C2A
     style CX3    fill:#E8E6E4,stroke:#888780,color:#2C2C2A
@@ -1095,7 +1105,7 @@ flowchart TD
 |---|---|---|
 | Purple | Lambda task | Validate, Create order, Advance status |
 | Green | Wait / Choice (WaitForTaskToken) | Wait for payment, Wait for restaurant |
-| Amber | SNS FIFO publish | order.created, order.confirmed |
+| Amber | SNS FIFO publish / Lambda archive | order.created, order.confirmed, Archive to Supabase |
 | Gray | Terminal state | CANCELLED × 3, End |
 
 ### 14.3 State Timeouts & Retry Policy
@@ -1108,6 +1118,7 @@ flowchart TD
 | Wait for restaurant | 5 min | N/A (external callback) | → CANCELLED (rejected) |
 | Publish SNS FIFO | 10 sec | 3× exponential | Step Functions retries, DLQ on exhaustion |
 | Advance status | 15 sec | 3× exponential | CloudWatch alarm, manual retry via ops |
+| Archive to Supabase | 15 sec | 3× exponential | DLQ + CloudWatch alarm for manual retry |
 
 ---
 
@@ -1117,7 +1128,7 @@ flowchart TD
 
 The Delivery Service is the only backend component running on Fargate rather than Lambda. Three hard constraints force this choice:
 
-1. **Persistent WebSocket connections** — couriers push GPS every 10 seconds; customers hold a live tracking connection. Lambda's maximum 29-second execution timeout cannot support either.
+1. **Persistent WebSocket connections** — couriers push GPS every 10 seconds across up to 2,000 concurrent connections. Lambda's maximum 29-second execution timeout cannot support long-lived connections at this scale.
 2. **Stateful in-memory routing** — the Assignment Engine keeps a small in-process map of `courier_id → current_order` to avoid a database round-trip on every GPS event. Lambda's stateless cold-start model makes this prohibitively expensive.
 3. **Graceful shutdown with active deliveries** — on ECS task termination (SIGTERM), the service must flush in-flight GPS writes to DynamoDB and reassign any active couriers before exiting. A 30-second grace period is required; Lambda does not support this.
 
@@ -1133,7 +1144,6 @@ config:
 graph TB
     subgraph External["External actors"]
         CA[Courier App PWA]
-        CU[Customer App]
         ECS[ECS health check]
     end
 
@@ -1143,14 +1153,14 @@ graph TB
         GPS["GPS tracker\n10 sec interval · buffer writes"]
         SM["Stage state machine\nPICKED_UP → ON_WAY → DELIVERED"]
         SQS_C["SQS FIFO consumer\norder.confirmed · order.status.*"]
-        RT["Supabase Realtime broadcaster\nStage update → WS push to customer"]
+        RT["Supabase courier-position bridge\nGPS write → active_courier_positions"]
         HC["GET /health\nECS health check · 200 OK"]
         GS["Graceful shutdown\nSIGTERM → flush GPS · close WS\nReassign via Lambda (2 min)"]
     end
 
     subgraph DataStores["Data stores"]
-        DY[(DynamoDB\ncourier_locations\norder_events)]
-        SB[(Supabase PostgreSQL\nassignments · orders · couriers)]
+        DY[(DynamoDB\nactive_orders · courier_states\ncourier_locations · order_events)]
+        SB[(Supabase PostgreSQL\nassignments · couriers\nactive_courier_positions)]
     end
 
     subgraph Messaging["Messaging"]
@@ -1168,9 +1178,9 @@ graph TB
     GPS -->|Batch writes| DY
     SM -->|Write order_events| DY
     SM -->|Update assignments| SB
-    SM --> RT
     SM --> SNS_OUT
-    RT -->|Stage update| CU
+    GPS --> RT
+    RT -->|GPS position upsert| SB
     SQSQ -->|Pull events| SQS_C
     ECS -->|Poll /health| HC
     Fargate -->|Metrics| CW
@@ -1185,7 +1195,7 @@ graph TB
 | **GPS tracker** | Buffers GPS frames from couriers (10 sec cadence, 2,000 couriers = ~200 writes/sec peak), batch-writes to DynamoDB `courier_locations` | Courier WS message |
 | **Stage state machine** | Authoritative source for `PICKED_UP → ON_THE_WAY → DELIVERED` transitions; each transition writes to DynamoDB `order_events`, updates Supabase `assignments`, and publishes to SNS FIFO | Courier stage-update WS message |
 | **SQS FIFO consumer** | Long-polls `delivery-events.fifo`; routes `order.confirmed` to Assignment Engine and other order events to Stage State Machine | SQS FIFO queue |
-| **Supabase Realtime broadcaster** | On each stage transition, writes to Supabase `orders.status`; Supabase Realtime (PostgreSQL logical replication → WebSocket) pushes update to subscribed Customer App instances | Stage state machine transition |
+| **Supabase courier-position bridge** | On each GPS batch write, upserts `active_courier_positions` in Supabase; Supabase Realtime (PostgreSQL logical replication → WebSocket) fans out courier GPS position to subscribed Customer App instances. Order status is no longer pushed via Realtime — Customer App polls `GET /api/v1/orders/{orderId}` instead | GPS tracker batch write |
 | **GET /health** | Returns `200 OK` when all internal modules are initialised; used by ECS target group health check to gate traffic | ECS health check (every 30 sec) |
 | **Graceful shutdown** | On SIGTERM: stops accepting new WS connections, flushes GPS write buffer to DynamoDB, closes active WS connections, invokes reassignment Lambda for any in-progress deliveries | ECS task termination (SIGTERM) |
 
