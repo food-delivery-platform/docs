@@ -21,6 +21,79 @@
 
 ---
 
+## Message Flow Overview
+
+```mermaid
+---
+config:
+  theme: default
+  themeVariables:
+    fontSize: "13px"
+---
+flowchart LR
+    %% ─── External actors ───
+    OS(["Order Service\nStep Functions"])
+    CA(["Courier App\nReact PWA"])
+    CU(["Customer App\nNext.js"])
+    OPS(["Ops Dashboard"])
+    US(["User Service"])
+    SUB(["Notification Svc\nMonitoring Svc"])
+    CW(["CloudWatch"])
+
+    %% ─── Data stores ───
+    DY[("DynamoDB\ncourier_states\ncourier_locations\norder_events")]
+    SB[("Supabase\nassignments\nactive_courier_positions")]
+
+    %% ─── Delivery Service ───
+    DS["DELIVERY SERVICE\nFargate · Node.js · port 8080"]
+
+    %% ─── Ch.1 SQS FIFO Inbound ───
+    OS -->|"① SQS FIFO  delivery-events.fifo\norder.confirmed\norder.cancelled\norder.status.ready"| DS
+
+    %% ─── Ch.3 WebSocket Inbound: Courier → DS ───
+    CA -->|"③ WS port 8080  →  DS\nGPS_UPDATE\nSTAGE_UPDATE\nCOURIER_AVAILABLE\nCOURIER_UNAVAILABLE"| DS
+
+    %% ─── Ch.6 REST Inbound ───
+    CU  -->|"⑥ REST  poll ×5 s\nGET /deliveries/{orderId}"| DS
+    OPS -->|"⑥ REST\nGET /deliveries/{orderId}"| DS
+    CA  -->|"⑥ REST\nPOST courier/accept · decline\nGET couriers/{id}/active-order"| DS
+
+    %% ─── Ch.2 SNS FIFO Outbound ───
+    DS -->|"② SNS FIFO  order-events.fifo\ndelivery.courier_assigned\ndelivery.status.picked_up\ndelivery.status.on_the_way\ndelivery.status.delivered\ndelivery.status.failed\ndelivery.courier_reassigned"| SUB
+
+    %% ─── Ch.4 WebSocket Outbound: DS → Courier ───
+    DS -->|"④ WS port 8080  →  Courier\nNEW_TASK\nTASK_CANCELLED\nORDER_READY_FOR_PICKUP\nACK · ERROR"| CA
+
+    %% ─── Ch.5 Supabase Realtime → Customer (GPS only) ───
+    DS -->|"⑤ Lambda bridge → Supabase Realtime\nrealtime.courier_location  GPS only"| CU
+
+    %% ─── Ch.7 REST Outbound ───
+    DS -->|"⑦ REST internal\nGET /couriers?available=true&lat&lng&radius"| US
+    DS -->|"⑦ REST internal\nPATCH /orders/{orderId}/status\n→ DynamoDB UpdateItem  active_orders\nterminal state → archive to Supabase"| OS
+
+    %% ─── Ch.8 DynamoDB Writes ───
+    DS -->|"⑧ AWS SDK\ncourier_states  UpdateItem\ncourier_locations  BatchWrite\norder_events  PutItem"| DY
+
+    %% ─── Supabase Writes (via assignment + bridge) ───
+    DS -->|"⑧ HTTPS\nWrite assignments\nupsert active_courier_positions"| SB
+
+    %% ─── Ch.9 CloudWatch Metrics ───
+    DS -->|"⑨ PutMetricData\nWebSocketConnectionsCount\nGPSUpdateLagSeconds\nCourierAssignmentLagSeconds\nActiveFargateTaskCount\nStageMachineErrorCount"| CW
+
+    %% ─── Styles ───
+    classDef actor fill:#EBF5FB,stroke:#2E86C1,color:#1A5276
+    classDef store fill:#E9F7EF,stroke:#239B56,color:#1E8449
+    classDef ds    fill:#FEF9E7,stroke:#E67E22,color:#784212
+
+    class OS,CA,CU,OPS,US,SUB,CW actor
+    class DY,SB store
+    class DS ds
+```
+
+> Arrow numbers correspond to Channel Overview rows. `DS` ↔ `CA` has arrows in both directions — Courier App is both a WebSocket sender (Ch.3) and receiver (Ch.4) and a REST caller (Ch.6). `DS` ↔ `OS` is bidirectional — Order Service pushes SQS events in (Ch.1) and receives REST status patches out (Ch.7).
+
+---
+
 ## 1. SQS FIFO Inbound
 
 > Messages consumed from the `delivery-events.fifo` queue.  
