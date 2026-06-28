@@ -25,9 +25,12 @@
 #      endpoints (/preparing, /ready). Added 403 where a caller may lack access.
 #   4. order.created is NOT consumed by Payment (the pre-payment SM calls
 #      Payment directly via REST to open the session).
-#   5. Payment retries: the customer may retry payment within the 10-min
-#      window; only window expiry (EXPIRED_SESSION) cancels the order.
-#      >>> OPEN: confirm the exact retry window with the team. <<<
+#   5. Payment retries (PROPOSED default, pending Denis's final ok): the
+#      customer may retry payment within a 10-min window (industry standard,
+#      e.g. Vipps MobilePay). SOFT declines (insufficient funds, network) are
+#      retryable; HARD declines (stolen/closed card) are NOT. Order is cancelled
+#      only on window expiry (EXPIRED_SESSION) or explicit customer cancel.
+#      Retries capped at maxAttempts (5) within the window.
 #
 # NOTE: Examples deliberately reuse the SAME ids and addresses as the
 #       delivery-service contract (order-xyz, rest-456, user-123, courier-001)
@@ -519,14 +522,18 @@ channels:
         actorId: user-123
 
     # Published by Payment Service on a failed attempt.
-    # RETRY MODEL (per Denis's question #5):
-    #   retryable = true  -> a single decline does NOT cancel the order. It
-    #                        stays PENDING_PAYMENT, paymentUrl stays open, and
-    #                        the customer may retry within the 10-min window.
-    #   retryable = false -> the 10-min window elapsed (reason EXPIRED_SESSION)
-    #                        -> Order Service: PENDING_PAYMENT -> CANCELLED
-    #                        (cancel_reason PAYMENT_FAILED) + order.cancelled.
-    # >>> OPEN: confirm the retry window length / max attempts with the team. <<<
+    # RETRY MODEL (proposed default for Denis's question #5):
+    #   SOFT decline (insufficient funds, network glitch, temporary) -> the
+    #     order does NOT cancel. It stays PENDING_PAYMENT, paymentUrl stays open,
+    #     and the customer may retry within the 10-min window (up to maxAttempts).
+    #   HARD decline (stolen/closed/invalid card) -> retryable=false; do NOT
+    #     retry the same card (banks penalise this). Order stays PENDING_PAYMENT
+    #     and the app asks the customer for a DIFFERENT card.
+    #   Window expiry (reason EXPIRED_SESSION) OR explicit customer cancel ->
+    #     Order Service: PENDING_PAYMENT -> CANCELLED (cancel_reason
+    #     PAYMENT_FAILED) + order.cancelled.
+    # Rationale: SOFT declines are ~80-90% of failures and are recoverable;
+    # HARD declines are ~10-20% and must not be retried.
     payment.failed:
       MessageGroupId: order_id
       MessageDeduplicationId: "order_id + ':payment_failed:' + attempt"
@@ -535,10 +542,13 @@ channels:
         eventId: evt_01J0PAY0002ABCD
         timestamp: "2026-06-23T18:55:30.000Z"
         orderId: order-xyz
-        # Enum: CARD_DECLINED | INSUFFICIENT_FUNDS | EXPIRED_SESSION | OTHER
-        reason: CARD_DECLINED
+        # reason      Enum: CARD_DECLINED | INSUFFICIENT_FUNDS | EXPIRED_SESSION | OTHER
+        # declineType Enum: SOFT (temporary, retryable) | HARD (permanent, do NOT retry)
+        reason: INSUFFICIENT_FUNDS
+        declineType: SOFT
         attempt: 1                     # 1-based attempt counter within the window
-        retryable: true                # false once the 10-min window expires
+        maxAttempts: 5                 # cap retries within the 10-min window
+        retryable: true                # SOFT & within window -> true; HARD or expired -> false
         actorId: user-123
 
     # Published by delivery-service (its sns_fifo_outbound.delivery.courier_assigned).

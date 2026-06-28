@@ -14,7 +14,7 @@ This document is the Markdown view of `order-service-message-contracts.yaml`. Th
 2. **Status reads are served from DynamoDB** (a hot store) to offload Supabase; Supabase stays the canonical + history store.
 3. **Removed the generic `PATCH /orders/{id}/status`.** Delivery updates status **only** via SNS (consumed over SQS); the restaurant uses its own dedicated endpoints (`/preparing`, `/ready`). Added **403** responses where a caller may lack access.
 4. **`order.created` is not consumed by Payment** — the pre-payment machine calls Payment directly via REST to open the session.
-5. **Payment retries:** the customer may retry payment within the 10-min window; only window expiry (`EXPIRED_SESSION`) cancels the order. **OPEN: confirm the exact retry window / max attempts with the team.**
+5. **Payment retries (proposed default, pending Denis's final ok):** the customer may retry within a 10-min window (industry standard, e.g. Vipps MobilePay). **SOFT** declines (insufficient funds, network) are retryable; **HARD** declines (stolen/closed card) are not. The order is cancelled only on window expiry (`EXPIRED_SESSION`) or explicit customer cancel. Retries capped at `maxAttempts` (5).
 
 ---
 
@@ -577,11 +577,10 @@ Order Service subscribes `order-service-inbound.fifo` to the shared SNS FIFO top
 
 `MessageDeduplicationId: "order_id + ':payment_failed:' + attempt"`
 
-**Retry model (Denis's question #5):**
-- `retryable: true` — a single decline does **not** cancel the order. It stays `PENDING_PAYMENT`, `paymentUrl` stays open, and the customer may retry within the 10-min window.
-- `retryable: false` — the 10-min window elapsed (`reason: EXPIRED_SESSION`) → Order Service: `PENDING_PAYMENT → CANCELLED` (`cancel_reason: PAYMENT_FAILED`) + `order.cancelled`.
-
-> **OPEN: confirm the retry window length / max attempts with the team.**
+**Retry model (proposed default for Denis's question #5):**
+- **SOFT decline** (insufficient funds, network glitch — ~80–90% of failures) → `retryable: true`. Order stays `PENDING_PAYMENT`, `paymentUrl` stays open, customer may retry within the 10-min window (up to `maxAttempts`).
+- **HARD decline** (stolen/closed/invalid card — ~10–20%) → `retryable: false`. Do **not** retry the same card (banks penalise it); the app asks for a **different** card. Order stays `PENDING_PAYMENT`.
+- **Window expiry** (`reason: EXPIRED_SESSION`) **or explicit customer cancel** → `PENDING_PAYMENT → CANCELLED` (`cancel_reason: PAYMENT_FAILED`) + `order.cancelled`.
 
 ```json
 {
@@ -589,14 +588,16 @@ Order Service subscribes `order-service-inbound.fifo` to the shared SNS FIFO top
   "eventId": "evt_01J0PAY0002ABCD",
   "timestamp": "2026-06-23T18:55:30.000Z",
   "orderId": "order-xyz",
-  "reason": "CARD_DECLINED",
+  "reason": "INSUFFICIENT_FUNDS",
+  "declineType": "SOFT",
   "attempt": 1,
+  "maxAttempts": 5,
   "retryable": true,
   "actorId": "user-123"
 }
 ```
 
-`reason` enum: `CARD_DECLINED | INSUFFICIENT_FUNDS | EXPIRED_SESSION | OTHER`.
+`reason` enum: `CARD_DECLINED | INSUFFICIENT_FUNDS | EXPIRED_SESSION | OTHER`. `declineType` enum: `SOFT | HARD`.
 
 ### `delivery.courier_assigned`
 
