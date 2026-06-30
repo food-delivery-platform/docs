@@ -1,7 +1,7 @@
 # Delivery Service — Inter-Service Message Contracts
 
 **Service:** `delivery-service`  
-**Runtime:** Node.js / Lambda
+**Runtime:** Node.js + Express / AWS Fargate
 
 ---
 
@@ -11,8 +11,8 @@
 |---|---------|-----------|-----------|
 | 1 | [SQS Standard Inbound](#1-sqs-standard-inbound) | → Delivery Service | SQS Standard `delivery-events` |
 | 2 | [SNS Standard Outbound](#2-sns-standard-outbound) | Delivery Service → | SNS Standard `order-events` |
-| 3 | [REST Inbound](#3-rest-api-inbound) | Clients → Delivery Service | API Gateway / HTTPS |
-| 4 | [REST Outbound](#4-rest-api-outbound) | Delivery Service → Services | Internal HTTPS |
+| 3 | [REST Inbound](#3-rest-api-inbound) | Clients → Delivery Service | ALB / HTTPS |
+| 4 | [REST Outbound](#4-rest-api-outbound) | Delivery Service → Services / APIs | Internal HTTPS + Waze API |
 | 5 | [DynamoDB Writes](#5-dynamodb-write-shapes) | Delivery Service → DynamoDB | AWS SDK |
 | 6 | [CloudWatch Metrics](#6-cloudwatch-custom-metrics) | Delivery Service → CloudWatch | PutMetricData |
 
@@ -42,28 +42,30 @@ flowchart LR
     SB[("Supabase\nassignments")]
 
     %% ─── Delivery Service ───
-    DS["DELIVERY SERVICE\nLambda · Node.js"]
+    DS["DELIVERY SERVICE\nFargate · Node.js + Express"]
 
     %% ─── Ch.1 SQS Standard Inbound ───
     OS -->|"① SQS Standard  delivery-events\norder.preparing\norder.cancelled\norder.status.ready"| DS
 
     %% ─── Ch.3 REST Inbound ───
-    CA -->|"③ REST\nGET /deliveries/available?lat&lng&radius\nPOST /deliveries/{id}/accept\nPOST /deliveries/{id}/stage\nPATCH /couriers/{id}/location"| DS
-    CU  -->|"③ REST  poll ×5 s\nGET /deliveries/{orderId}\nPOST /deliveries/{id}/confirm-delivery"| DS
+    CA -->|"③ REST\nPATCH /couriers/{id}/gps  every 10 sec\nGET /deliveries/available  every 30 sec\nPOST /deliveries/{id}/accept\nPOST /deliveries/{id}/stage"| DS
+    CU  -->|"③ REST\nGET /deliveries/{orderId}\nPOST /deliveries/{id}/confirm-delivery"| DS
     OPS -->|"③ REST\nGET /deliveries/{orderId}"| DS
 
     %% ─── Ch.2 SNS Standard Outbound ───
     DS -->|"② SNS Standard  order-events\ndelivery.courier_assigned\ndelivery.status.picked_up\ndelivery.status.delivered\ndelivery.status.failed\ndelivery.courier_reassigned"| SUB
 
     %% ─── Ch.4 REST Outbound ───
-    DS -->|"④ REST internal\nGET /couriers?lat&lng&radius"| US
+    DS -->|"④ REST internal\nGET /couriers/{id}/profile"| US
     DS -->|"④ REST internal\nPATCH /orders/{orderId}/status\n→ DynamoDB UpdateItem  active_orders\nterminal state → archive to Supabase"| OS
 
-    %% ─── Ch.5 DynamoDB Writes ───
-    DS -->|"⑤ AWS SDK\ncourier_states  UpdateItem\norder_events  PutItem"| DY
+    %% ─── Waze API ───
+    WAZE(["Waze API"])
+    DS -->|"④ HTTPS\nETA: courier→restaurant (assignment)\nETA: restaurant→customer (pre-payment)"| WAZE
 
-    %% ─── Supabase Writes ───
-    DS -->|"⑤ HTTPS\nWrite assignments"| SB
+    %% ─── Ch.5 DynamoDB + Supabase Writes ───
+    DS -->|"⑤ AWS SDK\ncourier_states  UpdateItem (GPS every 10 sec)\nactive_orders  UpdateItem (eligible_courier_ids)\norder_events  PutItem"| DY
+    DS -->|"⑤ HTTPS  every 10 min (GPS sync)\ncourier_locations  upsert (PostGIS)\nassignments  write"| SB
 
     %% ─── Ch.6 CloudWatch Metrics ───
     DS -->|"⑥ PutMetricData\nCourierAssignmentLagSeconds\nUnacceptedOrdersCount\nStageMachineErrorCount"| CW
@@ -78,7 +80,7 @@ flowchart LR
     class DS ds
 ```
 
-> Arrow numbers correspond to Channel Overview rows. `DS` ↔ `CA` and `DS` ↔ `CU` are bidirectional via REST. `DS` ↔ `OS` is bidirectional — Order Service pushes SQS events in (Ch.1) and receives REST status patches out (Ch.4).
+> Arrow numbers correspond to Channel Overview rows. `DS` ↔ `CA` and `DS` ↔ `CU` are bidirectional via REST. `DS` ↔ `OS` is bidirectional — Order Service pushes SQS events in (Ch.1) and receives REST status patches out (Ch.4). Waze API is called both during assignment (Ch.4) and for pre-payment ETA.
 
 ---
 
@@ -304,19 +306,59 @@ Emitted when the original courier cancels mid-delivery or becomes unresponsive. 
 
 ## 3. REST API Inbound
 
-> Endpoints exposed by Delivery Service via **API Gateway**.  
+> Endpoints exposed by Delivery Service via **ALB** (Fargate target group).  
 > Courier App endpoints require `Authorization: Bearer <jwt_access_token>` (Cognito JWT).  
-> Customer App endpoints require NextAuth.js session cookie.
+> Customer App endpoints require Firebase session cookie (verified server-side).
+
+---
+
+### `PATCH /api/v1/couriers/{courierId}/gps`
+
+Courier App sends GPS position every **10 seconds**. Delivery Service writes to DynamoDB `courier_states.lastLocation`. This table is the live GPS source of truth; Supabase `courier_locations` is batch-synced from it every 10 minutes.
+
+**Request body**
+```json
+{
+  "lat": 32.0800,
+  "lng": 34.7850,
+  "timestamp": "2026-06-28T19:15:00.000Z"
+}
+```
+
+**Response 200** — empty body.
+
+---
+
+### `GET /api/v1/deliveries/eta`
+
+Called by **Order Service** during checkout (before customer pays). Returns Waze-calculated travel time from restaurant to customer delivery address so the customer sees an accurate ETA.
+
+**Request**
+```
+GET /api/v1/deliveries/eta?restaurantId=rest-456&deliveryLat=32.0742&deliveryLng=34.7922
+Authorization: Bearer <internal_service_jwt>
+```
+
+**Response 200**
+```json
+{
+  "estimatedDeliveryMinutes": 22,
+  "restaurantToCustomerKm": 3.1,
+  "calculatedAt": "2026-06-28T18:49:00.000Z"
+}
+```
+
+> If Waze API is unavailable, the service returns a distance-based estimate and sets `"source": "fallback_distance"`.
 
 ---
 
 ### `GET /api/v1/deliveries/available`
 
-Courier App polls for available orders within `radius` km of current position. Returns orders in `PREPARING` or `READY` status whose restaurant is within the radius. Courier with any status in `available` can see these.
+Courier App polls every **30 seconds** for paid orders for which this courier is in the `eligible_courier_ids` list (written by Assignment Engine after Waze filtering). The courier's `courierId` is extracted from the JWT — no lat/lng parameter needed.
 
 **Request**
 ```
-GET /api/v1/deliveries/available?lat=32.0810&lng=34.7800&radius=5
+GET /api/v1/deliveries/available
 Authorization: Bearer <jwt_access_token>
 ```
 
@@ -330,11 +372,11 @@ Authorization: Bearer <jwt_access_token>
       "restaurantName": "HaBurger",
       "restaurantAddress": { "lat": 32.0853, "lng": 34.7818, "street": "Rothschild Blvd 1" },
       "customerAddress": { "lat": 32.0742, "lng": 34.7922 },
-      "distanceKm": 1.2,
+      "estimatedPickupMinutes": 7,
+      "estimatedDeliveryMinutes": 22,
       "estimatedEarnings": 18.50,
       "currency": "ILS",
-      "items": [{ "name": "Shakshuka", "quantity": 2 }],
-      "estimatedPickupTime": "2026-06-28T19:05:00.000Z"
+      "items": [{ "name": "Shakshuka", "quantity": 2 }]
     }
   ]
 }
@@ -422,26 +464,11 @@ Customer confirms delivery in the Customer App. Once both courier (`newStage: DE
 
 ---
 
-### `PATCH /api/v1/couriers/{courierId}/location`
-
-Courier App periodically updates location (~30 sec interval when actively delivering). Delivery Service writes to `courier_states.lastLocation` in DynamoDB. Used by Assignment Engine for proximity queries.
-
-**Request body**
-```json
-{
-  "lat": 32.0800,
-  "lng": 34.7850,
-  "timestamp": "2026-06-28T19:15:00.000Z"
-}
-```
-
-**Response 200** — empty body.
-
 ### `GET /api/v1/deliveries/{orderId}`
 
-Returns current delivery state for an order. Reads from DynamoDB `active_orders` (order status) and `courier_states` (courier last-known location).  
+Returns current delivery state for an order. Reads from DynamoDB `active_orders` (order status) and `courier_states` (courier last-known GPS).  
 **Callers:** Customer App · Ops Dashboard · Order Service.  
-**Primary tracking mechanism for Customer App** — polled every 5 seconds.
+**Primary tracking mechanism for Customer App** — polled every 5 seconds. `courierLastLocation` reflects the last GPS push from Courier App (up to 10 sec old).
 
 **Request**
 ```
@@ -470,7 +497,7 @@ Authorization: Bearer <jwt_access_token>
 ```
 
 > **`status` enum (delivery-owned):** `ASSIGNED` · `PICKED_UP` · `DELIVERED` · `FAILED`  
-> `courierLastLocation` — last known position from periodic REST updates; not real-time GPS.
+> `courierLastLocation` — last known position from Courier App GPS push (every 10 sec). Max staleness: ~10 sec.
 
 **Response 404**
 ```json
@@ -484,7 +511,7 @@ Authorization: Bearer <jwt_access_token>
 
 ### `GET /health`
 
-Lambda health check. Returns `200` when all internal modules are ready.
+Fargate ECS health check. Returns `200` when all internal modules are ready; used by the ALB target group health check to determine task readiness.
 
 **Response 200**
 ```json
@@ -493,20 +520,22 @@ Lambda health check. Returns `200` when all internal modules are ready.
   "modules": {
     "sqsConsumer": "ready",
     "assignmentEngine": "ready",
-    "broadcastEngine": "ready"
+    "gpsSyncScheduler": "ready",
+    "wazeClient": "ready"
   },
   "timestamp": "2026-06-28T19:00:00.000Z"
 }
 ```
 
-**Response 503** — returned when any critical module fails to initialise.
+**Response 503** — returned when any critical module fails to initialise. ALB stops routing traffic to this task.
 ```json
 {
   "status": "degraded",
   "modules": {
     "sqsConsumer": "error",
     "assignmentEngine": "ready",
-    "broadcastEngine": "ready"
+    "gpsSyncScheduler": "ready",
+    "wazeClient": "ready"
   },
   "timestamp": "2026-06-28T19:00:00.000Z"
 }
@@ -516,39 +545,66 @@ Lambda health check. Returns `200` when all internal modules are ready.
 
 ## 4. REST API Outbound
 
-> Calls made **by** Delivery Service **to** other microservices.  
-> All requests use an internal service JWT in the `Authorization` header.
+> Calls made **by** Delivery Service **to** other microservices and external APIs.  
+> Internal calls use a service JWT in the `Authorization` header.
 
 ---
 
-### `GET /api/v1/couriers` → User Service
+### `GET /api/v1/couriers/{courierId}/profile` → User Service
 
-Called by the **Assignment Engine** to retrieve profile details (name, phone) for the courier(s) selected from DynamoDB. The Assignment Engine first queries the `courier_states` table using `GSI_couriers_by_status` (`status = "available"`) to get available couriers with their `lastLocation`, then calls User Service to fetch profile details for the selected candidate(s).
+Called by the **Assignment Engine** after filtering to fetch profile details (name, phone) for the selected courier before emitting the `delivery.courier_assigned` event.
 
 **Request**
 ```
-GET /api/v1/couriers?available=true&lat=32.0853&lng=34.7818&radius=5
+GET /api/v1/couriers/courier-001/profile
 Authorization: Bearer <internal_service_jwt>
 ```
-
-> `radius` — km search radius
 
 **Response 200**
 ```json
 {
-  "couriers": [
+  "courierId": "courier-001",
+  "name": "Avi Cohen",
+  "phone": "+972501234567",
+  "vehicleType": "bike"
+}
+```
+
+---
+
+### Waze API — ETA Calls
+
+Called by the **Assignment Engine** (courier→restaurant) and **ETA handler** (restaurant→customer). Authentication via API key stored in AWS Secrets Manager.
+
+#### Assignment: courier → restaurant (per candidate, up to 20 calls)
+
+**Request**
+```
+GET https://waze.com/row-RoutingManager/routingRequest
+  ?from=ll.{courierLat}%2C{courierLng}
+  &to=ll.{restaurantLat}%2C{restaurantLng}
+  &at=0&returnJSON=true
+Authorization: <waze_api_key>
+```
+
+**Response (used fields)**
+```json
+{
+  "alternatives": [
     {
-      "courierId": "courier-001",
-      "name": "Avi Cohen",
-      "phone": "+972501234567",
-      "vehicleType": "bike",
-      "location": { "lat": 32.0810, "lng": 34.7800 },
-      "distanceKm": 0.52,
-      "estimatedArrivalMinutes": 4
+      "response": {
+        "totalRouteTime": 420
+      }
     }
   ]
 }
 ```
+
+> `totalRouteTime` in seconds. Assignment Engine keeps couriers where `totalRouteTime / 60 ≤ X_MINUTES_THRESHOLD` (configurable, default 15 min).
+
+#### Pre-payment ETA: restaurant → customer
+
+Same endpoint, `from` = restaurant coords, `to` = customer delivery address coords. Returns `estimatedDeliveryMinutes` to Order Service for display at checkout.
 
 ---
 
@@ -590,8 +646,8 @@ Called by the **Stage State Machine** whenever a delivery stage changes. Order S
 |-----|------|-------|
 | `courierId` | PK (S) | Partition key — UUID |
 
-Live operational state for each courier. Written by Delivery Service on availability changes, courier assignment, REST location updates, and order completion. Replaces (upserts) the single item per courier — not append-only.  
-For MVP, couriers submit location via `PATCH /api/v1/couriers/{courierId}/location` at ~30-second intervals. `lastLocation` stores the most recent known position, used by the Assignment Engine for proximity queries.
+Live operational state for each courier. Written by Delivery Service on GPS updates, availability changes, courier assignment, and order completion. Replaces (upserts) the single item per courier — not append-only.  
+Couriers submit GPS via `PATCH /api/v1/couriers/{courierId}/gps` every **10 seconds**. `lastLocation` is the live GPS source of truth. The GPS sync scheduler reads `lastLocation` every 10 minutes and batch-upserts Supabase `courier_locations` (PostGIS geometry) for nearest-courier spatial queries.
 
 ```json
 {
@@ -621,7 +677,7 @@ For MVP, couriers submit location via `PATCH /api/v1/couriers/{courierId}/locati
 | Courier goes available | `available` | — |
 | Courier goes offline | `offline` | cleared |
 | Courier assigned to order | `busy` | set to `orderId` |
-| `PATCH /couriers/{id}/location` | unchanged | unchanged — only `lastLocation` updated |
+| `PATCH /couriers/{id}/gps` (every 10 sec) | unchanged | unchanged — only `lastLocation` updated |
 | Order `DELIVERED` / `FAILED` | `available` | cleared |
 
 **GSIs used by Delivery Service:**
@@ -675,9 +731,12 @@ Written on **every delivery stage transition** by the Stage State Machine. Immut
 
 | Metric | Unit | Example Value | Alarm Threshold |
 |--------|------|---------------|-----------------|
-| `CourierAssignmentLagSeconds` | Seconds | 8.4 | > 60 seconds |
+| `CourierAssignmentLagSeconds` | Seconds | 8.4 | > 120 seconds |
 | `UnacceptedOrdersCount` | Count | 0 | > 5 for > 5 min |
 | `StageMachineErrorCount` | Count | 0 | > 5 errors / 5 min |
+| `GpsSyncJobFailureCount` | Count | 0 | > 0 (any failure) |
+| `WazeApiErrorRate` | Percent | 0.5 | > 10% per 5 min |
+| `EligibleCouriersFound` | Count | 4 | < 1 for > 3 orders (no coverage alert) |
 
 **Example `PutMetricData` shape**
 
