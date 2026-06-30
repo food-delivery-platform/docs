@@ -45,7 +45,7 @@ This document is the Markdown view of `order-service-message-contracts.yaml`. Th
 
 ```
 CREATED | PENDING_PAYMENT | PAID | CONFIRMED | PREPARING | READY |
-COURIER_ASSIGNED | PICKED_UP | ON_THE_WAY | DELIVERED |
+COURIER_ASSIGNED | PICKED_UP | DELIVERED |
 CANCELLED | REFUNDED | FAILED
 ```
 
@@ -96,8 +96,8 @@ Create a new order. Starts the Step Functions pre-payment pipeline. **Caller:** 
     "customerId": "user-123",
     "restaurantId": "rest-456",
     "items": [
-      { "menuItemId": "item-1", "quantity": 2, "specialInstructions": "No onions" },
-      { "menuItemId": "item-2", "quantity": 1, "specialInstructions": null }
+      { "menuItemId": "item-1", "quantity": 2, "expectedUnitPrice": 32.00, "specialInstructions": "No onions" },
+      { "menuItemId": "item-2", "quantity": 1, "expectedUnitPrice": 14.50, "specialInstructions": null }
     ],
     "deliveryAddress": { "addressId": "addr-789", "lat": 32.0742, "lng": 34.7922, "street": "Ben Yehuda St 44", "city": "Tel Aviv" },
     "paymentMethod": "CARD"
@@ -154,7 +154,7 @@ Fetch the **full** order from Supabase (initial load of the tracking screen). Th
   "customerId": "user-123",
   "restaurantId": "rest-456",
   "restaurantName": "HaBurger",
-  "status": "ON_THE_WAY",
+  "status": "PICKED_UP",
   "items": [
     { "menuItemId": "item-1", "name": "Shakshuka", "quantity": 2, "unitPrice": 32.00 },
     { "menuItemId": "item-2", "name": "Lemonade", "quantity": 1, "unitPrice": 14.50 }
@@ -194,7 +194,7 @@ Fetch the **full** order from Supabase (initial load of the tracking screen). Th
 **Response `200 OK`**
 
 ```json
-{ "orderId": "order-xyz", "status": "ON_THE_WAY", "updatedAt": "2026-06-23T19:08:30.000Z" }
+{ "orderId": "order-xyz", "status": "PICKED_UP", "updatedAt": "2026-06-23T19:08:30.000Z" }
 ```
 
 **Response `403 Forbidden`**
@@ -223,7 +223,7 @@ Customer's own order history (paginated), from Supabase. **Caller:** customer-ap
     {
       "orderId": "order-xyz",
       "restaurantName": "HaBurger",
-      "status": "ON_THE_WAY",
+      "status": "PICKED_UP",
       "totalAmount": 90.50,
       "currency": "ILS",
       "createdAt": "2026-06-23T18:45:00.000Z"
@@ -621,7 +621,7 @@ Published by delivery-service (`sns_fifo_outbound.delivery.courier_assigned`). `
 
 ### `delivery.status.changed`
 
-Delivery stage events consumed to keep canonical `orders.status` in sync. Maps: `picked_up → PICKED_UP`, `on_the_way → ON_THE_WAY`, `delivered → DELIVERED` (then emits `order.completed`), `failed → FAILED` (then triggers refund flow). `MessageDeduplicationId: "order_id + ':delivery_status:' + stage"`
+Delivery stage events consumed to keep canonical `orders.status` in sync. Maps: `picked_up → PICKED_UP`, `delivered → DELIVERED` (then emits `order.completed`), `failed → FAILED` (then triggers refund flow). `MessageDeduplicationId: "order_id + ':delivery_status:' + stage"`
 
 ```json
 {
@@ -636,7 +636,7 @@ Delivery stage events consumed to keep canonical `orders.status` in sync. Maps: 
 }
 ```
 
-`stage` enum: `PICKED_UP | ON_THE_WAY | DELIVERED | FAILED`.
+`stage` enum: `PICKED_UP | DELIVERED | FAILED`.
 
 ---
 
@@ -659,8 +659,8 @@ Validate items + fetch authoritative prices and availability **before** creating
 {
   "restaurantId": "rest-456",
   "items": [
-    { "menuItemId": "item-1", "quantity": 2 },
-    { "menuItemId": "item-2", "quantity": 1 }
+    { "menuItemId": "item-1", "quantity": 2, "expectedUnitPrice": 32.00 },
+    { "menuItemId": "item-2", "quantity": 1, "expectedUnitPrice": 14.50 }
   ]
 }
 ```
@@ -824,7 +824,7 @@ Canonical record. Updated on every lifecycle transition.
   "id": "order-xyz",
   "customer_id": "user-123",
   "restaurant_id": "rest-456",
-  "status": "ON_THE_WAY",
+  "status": "PICKED_UP",
   "subtotal": 78.50,
   "delivery_fee": 12.00,
   "total_amount": 90.50,
@@ -866,7 +866,7 @@ Append-only audit log of every status transition (required by the spec — "хр
   "id": "hist-1",
   "order_id": "order-xyz",
   "previous_status": "PICKED_UP",
-  "new_status": "ON_THE_WAY",
+  "new_status": "DELIVERED",
   "actor_type": "COURIER",
   "actor_id": "courier-001",
   "changed_at": "2026-06-23T19:08:30.000Z"
@@ -891,7 +891,7 @@ A single-item-per-order table holding **only** the current live status. **Purpos
 ```json
 {
   "orderId": "order-xyz",
-  "status": "ON_THE_WAY",
+  "status": "DELIVERED",
   "previousStatus": "PICKED_UP",
   "updatedAt": "2026-06-23T19:08:30.000Z",
   "ttlEpoch": 1750800000
@@ -903,7 +903,7 @@ A single-item-per-order table holding **only** the current live status. **Purpos
 **Read item** (returned to the polling endpoint)
 
 ```json
-{ "orderId": "order-xyz", "status": "ON_THE_WAY", "updatedAt": "2026-06-23T19:08:30.000Z" }
+{ "orderId": "order-xyz", "status": "PICKED_UP", "updatedAt": "2026-06-23T19:08:30.000Z" }
 ```
 
 ---

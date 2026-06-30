@@ -47,7 +47,7 @@ runtime: "Node.js / AWS Lambda + Step Functions"
 _enums:
   order_status: &order_status >-
     CREATED | PENDING_PAYMENT | PAID | CONFIRMED | PREPARING | READY |
-    COURIER_ASSIGNED | PICKED_UP | ON_THE_WAY | DELIVERED |
+    COURIER_ASSIGNED | PICKED_UP | DELIVERED |
     CANCELLED | REFUNDED | FAILED
 
   cancel_reason: &cancel_reason >-
@@ -100,9 +100,11 @@ channels:
           items:
             - menuItemId: item-1
               quantity: 2
+              expectedUnitPrice: 32.00      # price shown to the customer; MenuService verifies it has not changed
               specialInstructions: "No onions"
             - menuItemId: item-2
               quantity: 1
+              expectedUnitPrice: 14.50      # price shown to the customer; MenuService verifies it has not changed
               specialInstructions: null
           deliveryAddress: *customer_address
           paymentMethod: CARD        # Enum: CARD | PAYPAL
@@ -144,7 +146,7 @@ channels:
         customerId: user-123
         restaurantId: rest-456
         restaurantName: HaBurger
-        status: ON_THE_WAY               # value from order_status enum
+        status: PICKED_UP               # value from order_status enum
         items:
           - menuItemId: item-1
             name: Shakshuka
@@ -184,7 +186,7 @@ channels:
           orderId: order-xyz
       response_200:
         orderId: order-xyz
-        status: ON_THE_WAY
+        status: PICKED_UP
         updatedAt: "2026-06-23T19:08:30.000Z"
       response_403:
         error: FORBIDDEN
@@ -208,7 +210,7 @@ channels:
         orders:
           - orderId: order-xyz
             restaurantName: HaBurger
-            status: ON_THE_WAY
+            status: PICKED_UP
             totalAmount: 90.50
             currency: ILS
             createdAt: "2026-06-23T18:45:00.000Z"
@@ -572,7 +574,7 @@ channels:
     # Delivery stage events consumed to keep canonical orders.status in sync.
     # This is HOW the courier/delivery status reaches Order Service — via SNS,
     # NOT via a REST call (the old PATCH endpoint was removed).
-    # Maps: picked_up->PICKED_UP, on_the_way->ON_THE_WAY,
+    # Maps: picked_up->PICKED_UP,
     #       delivered->DELIVERED (then emits order.completed),
     #       failed->FAILED (then triggers refund flow).
     delivery.status.changed:
@@ -584,7 +586,7 @@ channels:
         timestamp: "2026-06-23T19:28:00.000Z"
         orderId: order-xyz
         courierId: courier-001
-        # Enum: PICKED_UP | ON_THE_WAY | DELIVERED | FAILED
+        # Enum: PICKED_UP | DELIVERED | FAILED
         stage: DELIVERED
         location:
           lat: 32.0742
@@ -610,8 +612,10 @@ channels:
           items:
             - menuItemId: item-1
               quantity: 2
+              expectedUnitPrice: 32.00      # forwarded from customer; MenuService compares to current price
             - menuItemId: item-2
               quantity: 1
+              expectedUnitPrice: 14.50      # forwarded from customer; MenuService compares to current price
       response_200:
         valid: true
         restaurantOpen: true
@@ -753,7 +757,7 @@ channels:
         id: order-xyz
         customer_id: user-123
         restaurant_id: rest-456
-        status: ON_THE_WAY              # order_status enum (canonical copy)
+        status: PICKED_UP              # order_status enum (canonical copy)
         subtotal: 78.50
         delivery_fee: 12.00
         total_amount: 90.50
@@ -785,7 +789,7 @@ channels:
         id: hist-1
         order_id: order-xyz
         previous_status: PICKED_UP      # null for the very first row (CREATED)
-        new_status: ON_THE_WAY          # order_status enum
+        new_status: DELIVERED          # order_status enum
         # Enum: CUSTOMER | RESTAURANT | COURIER | SYSTEM
         actor_type: COURIER
         actor_id: courier-001
@@ -807,14 +811,14 @@ channels:
     # Upserted on every status transition.
     write_item:
       orderId: order-xyz
-      status: ON_THE_WAY
+      status: DELIVERED
       previousStatus: PICKED_UP
       updatedAt: "2026-06-23T19:08:30.000Z"
       ttlEpoch: 1750800000            # auto-expire ~24h after a terminal state
     # Returned to the polling endpoint.
     read_item:
       orderId: order-xyz
-      status: ON_THE_WAY
+      status: PICKED_UP
       updatedAt: "2026-06-23T19:08:30.000Z"
 
   # ----------------------------------------------------------
