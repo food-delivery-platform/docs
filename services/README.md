@@ -1,16 +1,16 @@
-# Микросервисы платформы доставки еды
+# Food Delivery Platform — Microservices
 
-Краткие описания — что делает каждый сервис и с кем взаимодействует. Без технических деталей реализации.
+Brief descriptions of what each service does and who it interacts with.
 
-| Сервис | Файл |
+| Service | File |
 |---|---|
-| Пользователи | [user-service.md](./user-service.md) |
-| Каталог (меню, рестораны) | [catalog-service.md](./catalog-service.md) |
-| Заказы | [order-service.md](./order-service.md) |
-| Оплата | [payment-service.md](./payment-service.md) |
-| Доставка и трекинг | [delivery-service.md](./delivery-service.md) |
-| Уведомления | [notification-service.md](./notification-service.md) |
-| Мониторинг и алерты | [monitoring-service.md](./monitoring-service.md) |
-| Аналитика | [analytics-service.md](./analytics-service.md) |
-| AI-чат для клиентов | [ai-chat-service.md](./ai-chat-service.md) |
-| База знаний (ингestion) | [kb-ingestion-service.md](./kb-ingestion-service.md) |
+| Users | [user-service.md](./user-service.md) |
+| Catalog (menus, restaurants) | [catalog-service.md](./catalog-service.md) |
+| Menu | [menu-service.md](./menu-service.md) |
+| Orders | [order-service.md](./order-service.md) |
+| Payments | [payment-service.md](./payment-service.md) |
+| Delivery & Tracking | [delivery-service.md](./delivery-service.md) |
+| Notifications | [notification-service.md](./notification-service.md) |
+| Monitoring & Alerts | [monitoring-service.md](./monitoring-service.md) |
+| Analytics | [analytics-service.md](./analytics-service.md) |
+| Knowledge Base Ingestion | [kb-ingestion-service.md](./kb-ingestion-service.md) |

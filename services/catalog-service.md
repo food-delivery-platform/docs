@@ -1,30 +1,41 @@
-# Catalog Service — Каталог ресторанов и меню
+# Catalog Service
 
-## Что делает
+**Runtime:** AWS Lambda (Node.js)  
+**Domain:** Catalog (customer-facing, read-only)
 
-Всё, что клиент видит до заказа: рестораны, магазины, меню, цены, категории.
+## Responsibility
 
-- Показывает список ресторанов и магазинов (поиск, фильтры, категории)
-- Хранит и отдаёт меню: блюда, цены, описания, фото
-- Позволяет ресторану/магазину редактировать меню и включать/выключать позиции
-- Переключает статус «открыт / закрыт» у заведения
-- Проверяет, доступны ли выбранные позиции при оформлении заказа
+Customer-facing menu browsing. Read-only queries against Supabase `menu_items`, `restaurants`, and `categories`. Does not write anything — all writes go through Menu Service.
 
-## Кто пользуется
+## Key Operations
 
-- **Клиентское приложение** — просмотр ресторанов, меню, корзина
-- **Дашборд ресторана/магазина** — CRUD меню, доступность, режим работы
-- **Order Service** — проверка наличия и актуальных цен перед созданием заказа
+| Operation | Endpoint |
+|-----------|----------|
+| Browse restaurants | `GET /restaurants` |
+| Search restaurants by name / cuisine | `GET /restaurants?search=&cuisine=` |
+| Get restaurant menu | `GET /restaurants/{id}/menu` |
+| Filter items by category / dietary label | `GET /menus/items?category=&label=` |
+| Get single menu item | `GET /menus/items/{id}` |
 
-## Связи с другими сервисами
+## Data Access
 
-| С кем | Зачем |
-|---|---|
-| **Order Service** | При создании заказа проверяет, что блюда есть в наличии и цены актуальны |
-| **User Service** | Заведение привязано к владельцу (ресторан/магазин) |
-| **KB Ingestion Service** | При обновлении меню или профиля ресторана обновляется база знаний для AI-чата |
-| **Analytics Service** | Отчёты по продажам опираются на данные каталога и заказов |
+| Store | Table | Access |
+|-------|-------|--------|
+| Supabase | `menu_items` | Read-only |
+| Supabase | `restaurants` | Read-only |
+| Supabase | `categories` | Read-only |
 
-## Что хранит
+Catalog Service owns no tables. It is a pure read projection of data managed by Menu Service and User Service.
 
-Рестораны, магазины, категории, позиции меню, цены, фото (ссылки на хранилище).
+## Integrations
+
+- **Order Service** — called synchronously to validate item availability during order creation
+- **Supabase REST API** — auto-generated endpoints used for read queries
+
+## Concurrency
+
+| Baseline | Burst |
+|----------|-------|
+| 50 concurrent | 100 concurrent |
+
+Stateless Lambda — scales automatically with customer browse traffic.

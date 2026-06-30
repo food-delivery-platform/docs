@@ -1,40 +1,56 @@
-# Monitoring Service — Мониторинг и алерты
+# Monitoring Service
 
-## Что делает
+**Runtime:** AWS Lambda (Node.js) · Scheduled (EventBridge cron every 5 min)  
+**Domain:** Operations & SLA Tracking
 
-Следит, чтобы заказы не «зависали», и предупреждает ops-команду о проблемах.
+## Responsibility
 
-- Записывает каждое изменение статуса заказа в журнал событий
-- Периодически проверяет: не слишком ли долго заказ на одном этапе
-- Сравнивает с SLA (например: ресторан должен принять за 5 мин, готовить — за 30 мин)
-- Генерирует алерты при нарушениях и системных сбоях
-- Отдаёт список алертов для Ops-дашборда
+Detects orders stuck in a stage longer than SLA thresholds, publishes metrics to CloudWatch, and triggers alerts to the ops team.
 
-## Кто пользуется
+## SLA Thresholds
 
-- **Ops-дашборд** — inbox алертов, просроченные заказы, SLA-индикаторы
-- **Ops-команда** — получает email/SMS при критических алертах
+| Stage | Max Allowed Time |
+|-------|-----------------|
+| `PENDING → PREPARING` | 30 sec (auto via payment) |
+| `PREPARING → READY` | 30 min |
+| `READY → PICKED_UP` | 15 min |
+| `PICKED_UP → DELIVERED` | 60 min |
 
-Клиенты и рестораны этот сервис напрямую не видят.
+## Flow
 
-## Связи с другими сервисами
+```
+EventBridge (every 5 min)
+  → Monitoring Service Lambda
+  → Reads order_events from DynamoDB
+  → Checks stage age against SLA thresholds
+  → CloudWatch PutMetricData (overdue_count)
+  → CloudWatch Alarm → SNS → ops team (Email / SMS)
+  → Ops Dashboard polls GET /api/alerts every 30 sec
+```
 
-| С кем | Зачем |
-|---|---|
-| **Order Service** | События смены статуса заказа |
-| **Delivery Service** | События по доставке |
-| **Notification Service** | Отправка алертов ops-команде |
-| **Analytics Service** | Журнал событий может использоваться для анализа узких мест |
+## Key Operations
 
-## Примеры SLA (из архитектуры)
+| Operation | Description |
+|-----------|-------------|
+| `check-sla-violations` | Scan `order_events` for overdue stage durations |
+| `publish-alerts` | Write overdue count to CloudWatch; alert ops on threshold breach |
+| `GET /api/alerts` | Endpoint polled by Ops Dashboard every 30 sec |
 
-| Этап | Норма |
-|---|---|
-| Ожидание подтверждения ресторана | 5 мин |
-| Готовка после подтверждения | 30 мин |
-| Курьер забирает после «готов» | 15 мин |
-| Доставка после «забрал» | 60 мин |
+## Data Access
 
-## Что хранит
+| Store | Table | Access |
+|-------|-------|--------|
+| DynamoDB | `order_events` | Read-only (scan stage transitions + timestamps) |
+| CloudWatch | Metrics + Alarms | Write (PutMetricData) |
 
-Журнал событий заказов (кто, когда, какой этап), метрики просрочек. Не владеет самими заказами — только наблюдает за ними.
+## Integrations
+
+- **SQS Standard** (`monitoring-queue`) — also consumes `order.status.changed` events to keep DynamoDB `order_events` up to date
+- **CloudWatch Alarms** — triggers ops notification via SNS when `overdue_count` exceeds threshold
+
+## Alert Thresholds
+
+| Metric | Alert |
+|--------|-------|
+| Overdue orders | > 50 simultaneously overdue |
+| False-positive alarms | > 100/day |

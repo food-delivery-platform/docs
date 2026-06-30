@@ -1,30 +1,46 @@
-# User Service — Пользователи и профили
+# User Service
 
-## Что делает
+**Runtime:** AWS Lambda (Node.js)  
+**Domain:** Identity & Profile
 
-Отвечает за людей в системе: регистрация, вход, профиль, адреса доставки и роли.
+## Responsibility
 
-- Регистрирует новых пользователей и связывает их с учётной записью
-- Хранит имя, телефон, email, роль (клиент, ресторан, магазин, курьер, админ)
-- Управляет адресами доставки клиента
-- Выдаёт и проверяет права доступа по роли
+Handles user registration, authentication, profile management, address book, and role assignment. Bridges two auth providers: Firebase OAuth 2.0 for customers and AWS Cognito for restaurant/admin/courier staff.
 
-## Кто пользуется
+## Key Operations
 
-- **Клиентское приложение** — регистрация, профиль, адреса
-- **Приложение курьера** — вход под ролью курьера
-- **Дашборд ресторана/магазина** — вход владельца или сотрудника
-- **Ops-дашборд** — админ управляет пользователями
+| Operation | Endpoint |
+|-----------|----------|
+| Register customer (Firebase) | `POST /users/register` |
+| Exchange Firebase ID token for session | `POST /auth/customer/session` |
+| Exchange Cognito JWT (staff login) | `POST /auth/staff/session` |
+| Get / update profile | `GET/PATCH /users/{id}/profile` |
+| Manage delivery addresses | `POST/PUT/DELETE /users/{id}/addresses` |
+| Assign / update role | `PATCH /users/{id}/role` (Admin only) |
 
-## Связи с другими сервисами
+## Auth Model
 
-| С кем | Зачем |
-|---|---|
-| **Catalog Service** | Владелец ресторана/магазина привязан к заведению через профиль |
-| **Order Service** | Заказ создаётся от имени клиента; нужны адрес и id пользователя |
-| **Notification Service** | Для SMS/email/push нужны телефон и email из профиля |
-| **Delivery Service** | Курьер — это пользователь с ролью COURIER |
+| User Type | Provider | Token |
+|-----------|----------|-------|
+| Customer | Firebase OAuth 2.0 (Google / Apple / Facebook) | Firebase ID token → HTTP-only session cookie (Next.js) |
+| Restaurant / Admin / Courier | AWS Cognito | JWT access token (1 h) + refresh token (30 d) |
 
-## Что хранит
+## Data Owned
 
-Пользователи, профили, адреса. Это «единый источник правды» о людях в платформе.
+| Store | Table | Role |
+|-------|-------|------|
+| Supabase | `users` | Core user record (email, phone, role, cognito_sub, firebase_uid) |
+| Supabase | `addresses` | Saved delivery addresses per user |
+| Supabase | `profiles` | Extended profile (preferences, avatar) |
+
+## Integrations
+
+- **AWS Cognito** — user pool for staff roles; JWT verification on every request
+- **Firebase Auth** — server-side token verification for customer JWTs
+- **Secrets Manager** — Firebase service account key, Cognito client secret
+
+## Concurrency
+
+| Baseline | Burst |
+|----------|-------|
+| 200 concurrent | 500 concurrent |

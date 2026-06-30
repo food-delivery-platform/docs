@@ -1,30 +1,40 @@
-# Analytics Service — Аналитика и отчёты
+# Analytics Service
 
-## Что делает
+**Runtime:** AWS Lambda (Python)  
+**Domain:** Business Intelligence
 
-Сводит данные для бизнеса: сколько заказов, выручка, тренды.
+## Responsibility
 
-- Считает дневную и недельную статистику по заказам
-- Формирует отчёты для ресторанов/магазинов (продажи, популярные позиции)
-- Показывает общие тренды платформы для админов
-- Агрегирует данные — не участвует в операционном процессе заказа в реальном времени
+Generates daily and weekly aggregations for restaurant performance reports, order trends, and platform-level statistics. Read-only — does not write to operational tables.
 
-## Кто пользуется
+## Key Operations
 
-- **Дашборд ресторана/магазина** — отчёты по продажам
-- **Ops-дашборд** — общая картина по платформе, метрики здоровья бизнеса
+| Operation | Endpoint |
+|-----------|----------|
+| Daily order report per restaurant | `GET /analytics/restaurants/{id}/daily` |
+| Weekly sales summary | `GET /analytics/restaurants/{id}/weekly` |
+| Platform-wide order trends | `GET /analytics/orders/trends` |
+| Courier performance stats | `GET /analytics/couriers/{id}/stats` |
 
-## Связи с другими сервисами
+## Data Access
 
-| С кем | Зачем |
-|---|---|
-| **Order Service** | Данные заказов — основа отчётов |
-| **Catalog Service** | Названия блюд, рестораны для детализации |
-| **Payment Service** | Суммы и статусы оплат |
-| **Monitoring Service** | Может использовать журнал событий для анализа задержек |
+| Store | Table | Access |
+|-------|-------|--------|
+| Supabase | `orders`, `order_items` | Read-only (archived terminal orders) |
+| Supabase | `restaurants`, `couriers` | Read-only |
+| MongoDB Atlas | — | Session data reads if needed |
 
-Analytics **читает** данные других сервисов, но не меняет заказы и не шлёт уведомления.
+Analytics Service owns no tables. All data is read from Supabase PostgreSQL after orders reach terminal state.
 
-## Что хранит
+## Integrations
 
-Агрегированные отчёты и кэш готовых выборок. Исходные транзакционные данные остаются у Order, Payment, Catalog.
+- **Restaurant Dashboard** — fetches daily/weekly reports via REST
+- **Ops Dashboard** — fetches platform-level trend data
+
+## Concurrency
+
+| Baseline | Burst |
+|----------|-------|
+| 10 concurrent | 50 concurrent |
+
+Aggregation queries run against the archived `orders` table (Supabase) — never against `active_orders` (DynamoDB) — so they do not impact the operational read path.

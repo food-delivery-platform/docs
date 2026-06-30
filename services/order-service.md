@@ -1,44 +1,49 @@
-# Order Service — Заказы
+# Order Service
 
-## Что делает
+**Runtime:** AWS Lambda (Node.js) · AWS Step Functions Express Workflow  
+**Domain:** Order Processing
 
-Центральный сервис жизненного цикла заказа — от «клиент нажал оформить» до «готов к выдаче курьеру».
+## Responsibility
 
-- Принимает новый заказ от клиента
-- Проверяет корзину через каталог (есть ли блюда, верные ли цены)
-- Запускает оплату и ждёт подтверждения
-- Ждёт, пока ресторан примет или отклонит заказ
-- Ведёт статусы: ожидание → подтверждён → готовится → готов
-- При отмене инициирует возврат денег
-- Сообщает всем заинтересованным сторонам о каждом изменении статуса
+Owns the full order lifecycle from creation to terminal state. Orchestrates payment, delivery handoff, and event publishing via a Step Functions state machine.
 
-## Кто пользуется
-
-- **Клиентское приложение** — оформление заказа, история, текущий статус
-- **Дашборд ресторана** — очередь входящих заказов, принять/отклонить, «готов»
-- **Ops-дашборд** — общая доска активных заказов
-
-## Связи с другими сервисами
-
-| С кем | Зачем |
-|---|---|
-| **Catalog Service** | Проверка позиций и цен перед созданием заказа |
-| **Payment Service** | Создание платежа, подтверждение, возврат при отмене |
-| **Delivery Service** | Передаёт заказ в доставку после подтверждения; получает обновления от курьера |
-| **Notification Service** | Получает события «статус изменился» → шлёт SMS/email/push |
-| **Monitoring Service** | Получает события для контроля SLA (не завис ли заказ на этапе) |
-| **Analytics Service** | Данные заказов для отчётов |
-
-## Жизненный цикл (упрощённо)
+## State Machine
 
 ```
-Клиент оформил → Ожидание оплаты → Ожидание ресторана → Готовится → Готов → (дальше Delivery Service)
-                     ↓                      ↓
-                  Отмена                 Отмена
+PENDING → PREPARING (auto, on payment) → READY → PICKED_UP → DELIVERED
+                                       ↘ CANCELLED / FAILED
 ```
 
-Order Service — «дирижёр» процесса: сам не доставляет и не шлёт SMS, но координирует всех участников через события.
+## Key Operations
 
-## Что хранит
+| Operation | Trigger |
+|-----------|---------|
+| Validate items | Catalog Service REST call |
+| Create order (DynamoDB) | Customer POST /orders |
+| Initiate payment | Payment Service REST call |
+| Wait for payment callback | WaitForTaskToken (Stripe webhook) |
+| Publish `order.preparing` to SNS | On payment confirmed |
+| Archive to Supabase | On terminal state (DELIVERED / CANCELLED / FAILED) |
 
-Заказы, состав заказа (позиции, количество, цена), история смены статусов.
+## Data Owned
+
+| Store | Table | Role |
+|-------|-------|------|
+| DynamoDB | `active_orders` | Live state during active lifecycle (TTL auto-cleanup) |
+| DynamoDB | `order_events` | Immutable audit log of every transition |
+| Supabase | `orders`, `order_items` | Permanent record, written once on terminal state |
+
+## Integrations
+
+- **Catalog Service** — validates item availability before order creation
+- **Payment Service** — creates Stripe payment intent; receives webhook callback
+- **Delivery Service** — requests ETA at checkout; receives delivery updates
+- **SNS Standard** (`order-events`) — fan-out to Delivery, Notification, Monitoring
+
+## Concurrency
+
+| Baseline | Lunch Peak Burst |
+|----------|-----------------|
+| 200 concurrent | 500 concurrent |
+
+P99 latency alert: > 2 sec · Error rate alert: > 5%

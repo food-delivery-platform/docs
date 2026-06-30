@@ -1,30 +1,49 @@
-# Payment Service — Оплата
+# Payment Service
 
-## Что делает
+**Runtime:** AWS Lambda (Node.js)  
+**Domain:** Payment
 
-Всё, что связано с деньгами за заказ.
+## Responsibility
 
-- Создаёт платёжную сессию, когда клиент оформляет заказ
-- Принимает подтверждение от платёжного провайдера (например, Stripe)
-- Сообщает Order Service: оплата прошла или не прошла
-- Делает возврат, если заказ отменён (ресторан отказал, таймаут, ошибка)
-- Защищает от двойного списания при повторных запросах
+Manages the full payment lifecycle: create Stripe payment intent, confirm payment via webhook, and trigger refunds on cancellation.
 
-## Кто пользуется
+## Key Operations
 
-Напрямую клиент не ходит в Payment Service — им управляет **Order Service** при оформлении. Клиент видит только экран оплаты.
+| Operation | Endpoint |
+|-----------|----------|
+| Create payment intent | `POST /payments/intent` |
+| Confirm payment (Stripe webhook) | `POST /payments/confirm` |
+| Refund | `POST /payments/refund` |
 
-- **Order Service** — создаёт платёж, ждёт callback, запрашивает refund
-- **Ops-дашборд** — при необходимости ручная сверка проблемных платежей
+## Flow
 
-## Связи с другими сервисами
+```
+Order Service → create intent → Stripe
+Stripe → webhook → API Gateway → confirm callback → Order Service (Step Functions task token)
+On CANCELLED → refund flow
+```
 
-| С кем | Зачем |
-|---|---|
-| **Order Service** | Основной партнёр: заказ не идёт дальше без успешной оплаты |
-| **Notification Service** | Через общую шину событий — можно уведомить клиента об ошибке оплаты |
-| **Analytics Service** | Суммы и статистика оплат для отчётов |
+## Data Owned
 
-## Что хранит
+| Store | Table | Role |
+|-------|-------|------|
+| Supabase | `payments` | Payment records (provider_ref, status, amount) |
 
-Записи о платежах: сумма, статус, ссылка на заказ, id транзакции у провайдера.
+## Integrations
+
+- **Stripe API** — payment intent, confirmation, idempotency_key = `order_id`
+- **SNS Standard** (`order-events`) — publishes `payment.confirmed` / `payment.failed`
+- **Order Service** — sends Step Functions task token callback on payment result
+
+## Resilience
+
+- Idempotency: Stripe `idempotency_key` prevents double-charging
+- Timeout: 60 sec Lambda timeout; max 3 retries on network errors
+- Fail-open on sustained Stripe timeout → manual reconciliation queue
+- Throttle behavior: return 429 immediately (not queued)
+
+## Concurrency
+
+| Baseline | Burst |
+|----------|-------|
+| 50 concurrent | 100 concurrent |

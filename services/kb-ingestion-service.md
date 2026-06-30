@@ -1,42 +1,60 @@
-# KB Ingestion Service — База знаний для AI
+# KB Ingestion Service
 
-## Что делает
+**Runtime:** AWS Lambda (Python) · SQS subscriber + S3 event trigger  
+**Domain:** Knowledge Management
 
-Подготавливает и обновляет «учебник», из которого AI-чат берёт ответы.
+## Responsibility
 
-- Принимает документы (FAQ, политики, инструкции), загруженные в хранилище
-- Автоматически подхватывает изменения меню и профилей ресторанов из каталога
-- Разбивает текст на небольшие фрагменты
-- Превращает фрагменты в векторные представления (для поиска по смыслу)
-- Сохраняет в базу знаний, откуда их читает AI Chat Service
+Keeps the RAG knowledge base up to date. Chunks new documents, generates embeddings via Bedrock, and upserts them into the Supabase pgvector table.
 
-Без этого сервиса чат не знал бы актуальное меню, правила возврата и часы работы ресторанов.
+## Trigger Sources
 
-## Кто пользуется
+| Source | Trigger | Content |
+|--------|---------|---------|
+| S3 (`kb-documents/`) | S3 Event Notification → SQS | FAQs, policies, guides (manual upload) |
+| Supabase `menu_items` | DB trigger / Edge Function → SQS | Menu updates (auto) |
+| Supabase `restaurants` | DB trigger / Edge Function → SQS | Restaurant info updates (auto) |
 
-Работает в фоне. Инициируют обновление:
+## Ingestion Pipeline
 
-- **Админы** — загрузка документов (FAQ, политики)
-- **Catalog Service** — при изменении меню или ресторана
-- **AI Chat Service** — потребитель готовой базы (только читает)
+```
+Trigger (S3 / DB event)
+  → SQS Standard (kb-ingestion-queue)
+  → KB Ingestion Lambda
+  1. Load source document
+  2. Chunk text  —  500 tokens, 50-token overlap (sliding window)
+  3. Batch embed  —  Bedrock Titan Embed Text v2  →  1536-dim vectors
+  4. Upsert to Supabase pgvector
+     ON CONFLICT (source_id) DO UPDATE  (replaces stale chunks)
+```
 
-## Связи с другими сервисами
+## Knowledge Base Content Types
 
-| С кем | Зачем |
-|---|---|
-| **Catalog Service** | Триггер при обновлении меню или карточки ресторана |
-| **AI Chat Service** | Результат работы — searchable база для RAG-ответов |
+| `source_type` | Content | Update Mode |
+|---------------|---------|-------------|
+| `faq` | Delivery times, refund policy, payment Q&A | Manual upload |
+| `menu` | All restaurant menus + item descriptions | Auto (menu update) |
+| `policy` | Courier policy, operational procedures | Manual upload |
+| `restaurant_info` | Restaurant descriptions, hours, cuisine | Auto (profile update) |
+| `guide` | How-to guides for all user roles | Manual upload |
 
-## Что попадает в базу знаний
+## Data Owned
 
-| Тип | Пример | Как обновляется |
-|---|---|---|
-| FAQ | Сроки доставки, возвраты | Загрузка документа |
-| Меню | Блюда и описания | Авто при изменении в каталоге |
-| Политики | Правила для курьеров | Загрузка документа |
-| Инфо о ресторане | Часы, кухня, адрес | Авто при изменении профиля |
-| Гайды | Как пользоваться приложением | Загрузка документа |
+| Store | Table | Access |
+|-------|-------|--------|
+| Supabase pgvector | `knowledge_chunks` | Write (upsert) |
+| S3 | `kb-documents/` | Read (source documents) |
 
-## Что хранит
+## Integrations
 
-Фрагменты текста с метаданными (откуда взято, тип, id ресторана). Хранится в общей векторной базе; сервис только пишет и обновляет, не отвечает клиентам напрямую.
+- **AWS Bedrock** — Titan Embed Text v2 for vector generation
+- **SQS Standard** (`kb-ingestion-queue`) — event queue from S3 and DB triggers
+- **Supabase pgvector** — HNSW-indexed `knowledge_chunks` table consumed by AI Chat Service
+
+## Concurrency
+
+| Baseline | Burst |
+|----------|-------|
+| 5 concurrent | 10 concurrent |
+
+Low concurrency is fine — ingestion is not on the customer critical path.
