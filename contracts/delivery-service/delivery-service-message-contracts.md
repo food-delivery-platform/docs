@@ -1,7 +1,7 @@
 # Delivery Service — Inter-Service Message Contracts
 
 **Service:** `delivery-service`  
-**Runtime:** Node.js + Express / AWS Fargate
+**Runtime:** Python + FastAPI / AWS Fargate
 
 ---
 
@@ -42,7 +42,7 @@ flowchart LR
     SB[("Supabase\nassignments")]
 
     %% ─── Delivery Service ───
-    DS["DELIVERY SERVICE\nFargate · Node.js + Express"]
+    DS["DELIVERY SERVICE\nFargate · Python + FastAPI"]
 
     %% ─── Ch.1 SQS Standard Inbound ───
     OS -->|"① SQS Standard  delivery-events\norder.preparing\norder.cancelled\norder.status.ready"| DS
@@ -518,10 +518,10 @@ Fargate ECS health check. Returns `200` when all internal modules are ready; use
 {
   "status": "ok",
   "modules": {
-    "sqsConsumer": "ready",
-    "assignmentEngine": "ready",
-    "gpsSyncScheduler": "ready",
-    "wazeClient": "ready"
+    "sqs_consumer": "ready",
+    "assignment_engine": "ready",
+    "gps_sync_scheduler": "ready",
+    "waze_client": "ready"
   },
   "timestamp": "2026-06-28T19:00:00.000Z"
 }
@@ -532,10 +532,10 @@ Fargate ECS health check. Returns `200` when all internal modules are ready; use
 {
   "status": "degraded",
   "modules": {
-    "sqsConsumer": "error",
-    "assignmentEngine": "ready",
-    "gpsSyncScheduler": "ready",
-    "wazeClient": "ready"
+    "sqs_consumer": "error",
+    "assignment_engine": "ready",
+    "gps_sync_scheduler": "ready",
+    "waze_client": "ready"
   },
   "timestamp": "2026-06-28T19:00:00.000Z"
 }

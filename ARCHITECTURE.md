@@ -1,7 +1,7 @@
 # Food Delivery Platform — High Level Architecture (HLA) + MVP Plan
 
 **Scale:** ~100,000 users | 300 restaurants | 2,000 couriers  
-**Stack:** Next.js on Vercel (Customer Web) + React (Ops apps) · Node.js/Express · AWS Fargate (Delivery Service, Menu Service) · AWS Lambda · Supabase (PostgreSQL + pgvector) · DynamoDB · MongoDB Atlas · AWS (Cognito [Restaurant/Admin/Courier], SNS Standard, SQS Standard, Bedrock, CloudWatch, S3/CloudFront) · Firebase OAuth 2.0 (Customer auth) · Waze API (ETA) · OpenAI API (optional)
+**Stack:** Next.js on Vercel (Customer Web) + React (Ops apps) · Node.js/Express · Python/FastAPI (Delivery Service) · AWS Fargate (Delivery Service, Menu Service) · AWS Lambda · Supabase (PostgreSQL + pgvector) · DynamoDB · MongoDB Atlas · AWS (Cognito [Restaurant/Admin/Courier], SNS Standard, SQS Standard, Bedrock, CloudWatch, S3/CloudFront) · Firebase OAuth 2.0 (Customer auth) · Waze API (ETA) · OpenAI API (optional)
 
 ---
 
@@ -241,7 +241,7 @@ graph LR
     end
 
     subgraph FargateGroup["Fargate Services"]
-        DS[Delivery Service\nFargate · Node.js+Express]
+        DS[Delivery Service\nFargate · Python+FastAPI]
         MES[Menu Service\nFargate · Node.js+Express]
     end
 
@@ -295,7 +295,7 @@ graph LR
 |---|---|---|---|---|---|
 | **Order Service** | Order Processing | Order creation, state machine (PENDING→PREPARING→READY→PICKED_UP→DELIVERED), event publishing | Lambda (Node.js) | 500–1000 concurrent | REST + SNS publisher |
 | **Payment Service** | Payment | Payment intent creation, confirmation, refunds. Stripe integration | Lambda (Node.js) | 100–200 concurrent | REST + SNS publisher |
-| **Delivery Service** | Delivery Coordination | GPS collection (10 s), GPS sync to Supabase (10 min), Waze ETA, proximity assignment, stage updates | **Fargate** (Node.js+Express) | 1–2 tasks (auto-scale) | REST + SQS subscriber |
+| **Delivery Service** | Delivery Coordination | GPS collection (10 s), GPS sync to Supabase (10 min), Waze ETA, proximity assignment, stage updates | **Fargate** (Python+FastAPI) | 1–2 tasks (auto-scale) | REST + SQS subscriber |
 | **Menu Service** | Menu Management | Restaurant-facing menu CRUD, category management, availability toggles, AI dish card (Bedrock) | **Fargate** (Node.js+Express) | 1–2 tasks | REST |
 | **User Service** | Identity & Profile | User registration, authentication, profile/address management, role assignment | Lambda (Node.js) | 200–500 concurrent | REST |
 | **Catalog Service** | Catalog (read) | Customer-facing menu browsing, search/filter — read-only queries against Supabase `menu_items` | Lambda (Node.js) | 50–100 concurrent | REST |
@@ -492,7 +492,7 @@ Stripe's native `idempotency_key` prevents double-charging at the payment layer.
 - **Lambda**: Node.js runtime pre-warmed via CloudWatch Events (ping every 5 min to keep warm)
   - Cold start ~500 ms (acceptable for MVP)
 - **Fargate (Delivery Service, Menu Service)**: containers start once per task launch; no cold-start concern after initial deployment. ECS health check confirms readiness before traffic is routed.
-- **Database connections**: Lambda — pooled via PgBouncer (Supabase managed); Fargate — persistent connection pool (pg-pool) maintained for the lifetime of the container task. MongoDB Atlas connection pooling built-in.
+- **Database connections**: Lambda — pooled via PgBouncer (Supabase managed); Fargate — persistent connection pool maintained for the lifetime of the container task (`asyncpg` pool for Delivery Service; `pg-pool` for Menu Service). MongoDB Atlas connection pooling built-in.
 
 ---
 
@@ -504,7 +504,7 @@ Stripe's native `idempotency_key` prevents double-charging at the payment layer.
 | **Catalog Service** | Customer-facing menu browsing, search (read-only) | Lambda (Node.js) | Supabase |
 | **Menu Service** | Restaurant menu CRUD, categories, availability, AI dish card | **Fargate** (Node.js+Express) | Supabase, S3 (images), Bedrock |
 | **Order Service** | Order lifecycle state machine, event publishing | Lambda (Node.js) | Supabase, SNS Standard, Stripe |
-| **Delivery Service** | GPS collection, courier proximity assignment (Waze), stage updates | **Fargate** (Node.js+Express) | DynamoDB, Supabase, Waze API, SNS Standard |
+| **Delivery Service** | GPS collection, courier proximity assignment (Waze), stage updates | **Fargate** (Python+FastAPI) | DynamoDB, Supabase, Waze API, SNS Standard |
 | **Payment Service** | Payment intent, confirm, refund | Lambda (Node.js) | Stripe API, SNS Standard |
 | **Notification Service** | Push / SMS / email via SNS | Lambda (Node.js) | SNS Standard, SQS Standard |
 | **Monitoring Service** | Check stage SLAs, alert on overdue orders | Scheduled Lambda | DynamoDB, CloudWatch, SNS |
@@ -615,7 +615,7 @@ graph TB
 
     subgraph Compute["Backend Compute"]
         AG2[API Gateway\nREST] --> LMB["Lambda Functions\n(Order, Payment, User, Catalog,\nNotification, Monitoring, Analytics, AI)"]
-        AG2 --> ECS["ECS Fargate\nDelivery Service · Menu Service\n(Node.js + Express)"]
+        AG2 --> ECS["ECS Fargate\nDelivery Service (Python + FastAPI)\nMenu Service (Node.js + Express)"]
         LMB --> SBD[(Supabase\nPostgreSQL + PostGIS)]
         ECS --> SBD
         LMB --> DYN[(DynamoDB\nOn-demand)]
@@ -664,7 +664,7 @@ Transport:       HTTPS only (Vercel enforced for Customer App; CloudFront for da
 Secrets:         AWS Secrets Manager (DB creds, Stripe keys, Waze API key, Firebase service account)
 Config:          Environment variables for non-sensitive (LOG_LEVEL, REGION)
 IAM:             Each Lambda has minimal role; Fargate tasks use task roles (least privilege)
-Input:           Validation on API Gateway + service layer (Zod / Joi)
+Input:           Validation on API Gateway + service layer (Zod / Joi for Node.js services; Pydantic for Delivery Service)
 ```
 
 ---
@@ -717,9 +717,15 @@ sequenceDiagram
 
 ### Why Fargate for Delivery Service and Menu Service?
 - **Delivery Service** runs a background GPS sync scheduler (DynamoDB → Supabase every 10 min) — Lambda's invocation model cannot host in-process recurring jobs. Fargate keeps the scheduler alive without an external EventBridge trigger per service.
-- **Waze API calls** are sequential and latency-sensitive: building a chain of ~20 calls inside a Lambda cold start on the order-creation path is unacceptable. A warm Express server eliminates this.
+- **Waze API calls** are sequential and latency-sensitive: building a chain of ~20 calls inside a Lambda cold start on the order-creation path is unacceptable. A warm FastAPI/uvicorn server eliminates this.
 - **Persistent DB connection pool** — Delivery Service queries Supabase PostGIS for spatial nearest-courier lookups; a warm connection pool avoids connection-setup overhead on every invocation.
 - **Menu Service** on Fargate shares the same ECS cluster, keeping ops overhead low while avoiding Lambda's cold-start latency on image upload flows.
+
+### Why Python (FastAPI) for Delivery Service?
+- **Async-first**: FastAPI runs on ASGI (Starlette + uvicorn) with native `asyncio` — ideal for the concurrent mix of GPS writes (every 10 sec per active courier) and up to 20 parallel Waze API calls per assignment event.
+- **Pydantic validation**: All inbound GPS coordinates, stage transitions, and SQS event payloads are validated against strict Pydantic schemas — critical for data that writes directly to DynamoDB and drives financial state transitions.
+- **APScheduler**: Python's `APScheduler` provides reliable in-process background job scheduling for the 10-minute GPS sync without an external trigger.
+- **Auto-generated OpenAPI docs**: FastAPI produces `/docs` and `/openapi.json` automatically, reducing drift between implementation and the contracts defined in `delivery-service-message-contracts.md`.
 
 ### Why Firebase OAuth 2.0 for Customers (not Cognito)?
 - Firebase OAuth 2.0 provides Google / Apple / Facebook social login out-of-the-box — critical for customer acquisition (one-tap sign-in)
@@ -800,7 +806,7 @@ sequenceDiagram
 
 ### Team Roles
 - **Engineer A** — Backend (Node.js), Order/Payment/Auth services
-- **Engineer B** — Backend (Node.js), Catalog/Delivery/Notification services  
+- **Engineer B** — Backend (Node.js + Python), Catalog / Delivery Service (Python FastAPI) / Notification services  
 - **Engineer C** — Frontend (Next.js + React), all 4 applications + AWS IaC setup
 
 ---
@@ -864,7 +870,7 @@ food-delivery/
 │
 ├── services/                  # Backend microservices (FSD-inspired slices)
 │   ├── order-service/         ← expanded in §12.3
-│   ├── delivery-service/      # Fargate · Node.js+Express · GPS sync · Waze API
+│   ├── delivery-service/      # Fargate · Python+FastAPI · GPS sync · Waze API
 │   ├── menu-service/          # Fargate · Node.js+Express · restaurant menu CRUD
 │   ├── catalog-service/       # Lambda · read-only customer catalog browsing
 │   ├── payment-service/
@@ -996,7 +1002,7 @@ order-service/
     └── middleware.ts             # JWT auth, error handler, logger
 ```
 
-All other services follow the same four-folder pattern (`handlers / features / entities / shared`). Key slices per service:
+Node.js services follow the same four-folder pattern (`handlers / features / entities / shared`). The Delivery Service (Python + FastAPI) uses a parallel feature-slice structure with FastAPI routers, Pydantic schemas, and `APScheduler` for background tasks instead of Express handlers and Zod. Key slices per service:
 
 | Service | Notable feature slices |
 |---|---|
@@ -1049,11 +1055,13 @@ Shared code consumed by all frontend apps and backend services. **No business lo
 
 ```
 shared/
-├── types/                        # Canonical TypeScript types (Order, MenuItem, Courier …)
-├── events/                       # SNS/SQS event payload schemas (order.preparing, delivery.* …)
+├── types/                        # Canonical TypeScript types (Order, MenuItem, Courier …) — Node.js services only
+├── events/                       # SNS/SQS event payload schemas (order.preparing, delivery.* …) — Delivery Service mirrors these as Pydantic models
 ├── middleware/                   # JWT validation (Cognito + NextAuth.js), error handler, logger
 └── ai/                           # Bedrock / OpenAI client wrappers, prompt templates
 ```
+
+> **Cross-language boundary**: The Delivery Service (Python) does not consume TypeScript types from `shared/types/`. It maintains its own Pydantic schemas that mirror the same SNS/SQS event contracts defined in `shared/events/`. Any change to a shared event payload must be reflected in both the TypeScript schema and the Pydantic model.
 
 ---
 
@@ -1323,11 +1331,11 @@ flowchart TD
 
 ### 15.1 Why Fargate
 
-The Delivery Service runs as a **long-lived Node.js + Express server on AWS Fargate**:
+The Delivery Service runs as a **long-lived Python + FastAPI server on AWS Fargate**:
 
-1. **In-process GPS sync scheduler** — a background job runs every 10 minutes to batch-sync courier GPS from DynamoDB to Supabase `courier_locations`. Lambda's request-scoped execution model cannot host this kind of recurring in-process job without an external trigger per tick.
-2. **Waze API call chains** — finding eligible couriers requires calling Waze once per candidate (up to 20 calls per order). A warm Express server with persistent connections avoids Lambda cold-start latency on this path.
-3. **Persistent PostgreSQL connection pool** — PostGIS nearest-courier queries benefit from a warm pg-pool rather than reconnecting on every Lambda invocation.
+1. **In-process GPS sync scheduler** — a background job runs every 10 minutes to batch-sync courier GPS from DynamoDB to Supabase `courier_locations`. Lambda's request-scoped execution model cannot host this kind of recurring in-process job without an external trigger per tick. Python's `APScheduler` runs inside the same uvicorn process.
+2. **Waze API call chains** — finding eligible couriers requires calling Waze once per candidate (up to 20 calls per order). A warm FastAPI/uvicorn server with persistent connections avoids Lambda cold-start latency on this path.
+3. **Persistent PostgreSQL connection pool** — PostGIS nearest-courier queries benefit from a warm `asyncpg` connection pool rather than reconnecting on every Lambda invocation.
 
 ### 15.2 Courier Assignment Flow
 
@@ -1381,7 +1389,7 @@ graph TB
         APIGW[ALB / API Gateway]
     end
 
-    subgraph Fargate["Delivery Service — Fargate (Node.js + Express)"]
+    subgraph Fargate["Delivery Service — Fargate (Python + FastAPI)"]
         GPSH["GPS handler\nPATCH /couriers/{id}/gps\nwrite → DynamoDB every 10 sec"]
         SYNC["GPS sync scheduler\nevery 10 min\nDynamoDB → Supabase courier_locations"]
         ETAh["ETA handler\nGET /deliveries/eta\nWaze: restaurant → customer"]
@@ -1435,7 +1443,7 @@ graph TB
 | Module | Responsibility | Trigger |
 |---|---|---|
 | **GPS handler** | Writes courier GPS to DynamoDB `courier_states.lastLocation`; called every 10 sec from Courier App | `PATCH /couriers/{id}/gps` |
-| **GPS sync scheduler** | Reads all active courier GPS from DynamoDB; batch-upserts `courier_locations` (PostGIS geometry) in Supabase for spatial nearest-courier queries | In-process `setInterval`, every 10 min |
+| **GPS sync scheduler** | Reads all active courier GPS from DynamoDB; batch-upserts `courier_locations` (PostGIS geometry) in Supabase for spatial nearest-courier queries | In-process APScheduler job, every 10 min |
 | **ETA handler** | Calls Waze API for restaurant→customer travel time; returned to Order Service pre-payment so customer sees delivery ETA at checkout | `GET /deliveries/eta` |
 | **Assignment engine** | On `order.preparing`: (1) PostGIS query for 20 nearest couriers to restaurant, (2) Waze API per courier for arrival time to restaurant, (3) keep those ≤ threshold minutes, (4) write `eligible_courier_ids` to DynamoDB `active_orders` | SQS consumer: `order.preparing` |
 | **Poll handler** | Returns available paid orders for which this courier is listed in `eligible_courier_ids` | `GET /deliveries/available` — Courier App polls every 30 sec |
