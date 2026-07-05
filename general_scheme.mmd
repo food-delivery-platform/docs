@@ -1,11 +1,16 @@
 flowchart
 
-DELIVERY[Delivery service] --> DB[(Database)]
+DELIVERY[Delivery service] --> COORDINATES
 ORDER[Order Service] --> DB
 RESTAURANT[Restaurant Service] --> |CRUD MenuItems| DB_MENU_ITEMS
 RESTAURANT[Restaurant Service] --> |Read\nChange status| DB_ORDERS
-A([👤 Restaurant\nrepresentative]) --> RESTAURANT[Restaurant Service]
+RESTAURANT_USER([👤 Restaurant\nrepresentative]) --> RESTAURANT[Restaurant Service]
 subgraph DB
     DB_MENU_ITEMS[Menu items]
     DB_ORDERS[Orders]
 end
+COURIER([👤 Courier]) --> |Often\n10 sec|DELIVERY[Delivery service]
+subgraph DYNAMO_DB
+    COORDINATES[(Coordinates)]
+end
+COORDINATES_REDUCER([Coordinates reducer])
