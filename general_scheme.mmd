@@ -1,0 +1,11 @@
+flowchart
+
+DELIVERY[Delivery service] --> DB[(Database)]
+ORDER[Order Service] --> DB
+RESTAURANT[Restaurant Service] --> |CRUD MenuItems| DB_MENU_ITEMS
+RESTAURANT[Restaurant Service] --> |Read\nChange status| DB_ORDERS
+A([👤 Restaurant\nrepresentative]) --> RESTAURANT[Restaurant Service]
+subgraph DB
+    DB_MENU_ITEMS[Menu items]
+    DB_ORDERS[Orders]
+end
