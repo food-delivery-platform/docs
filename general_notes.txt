@@ -1,0 +1,4 @@
+All services inside AWS VPC uses one API Gateway and ALB (Load balancers).
+Customers can be authorized by some OAuth2 provider or be registered in our service (Cognito).
+Admins, couriers, and customers are authorized by Cognito only.
+
