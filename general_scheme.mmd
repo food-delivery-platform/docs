@@ -1,16 +1,28 @@
 flowchart
 
 DELIVERY[Delivery service] --> COORDINATES
-ORDER[Order Service] --> DB
-RESTAURANT[Restaurant Service] --> |CRUD MenuItems| DB_MENU_ITEMS
-RESTAURANT[Restaurant Service] --> |Read\nChange status| DB_ORDERS
 RESTAURANT_USER([👤 Restaurant\nrepresentative]) --> RESTAURANT[Restaurant Service]
-subgraph DB
-    DB_MENU_ITEMS[Menu items]
-    DB_ORDERS[Orders]
-end
 COURIER([👤 Courier]) --> |Often\n10 sec|DELIVERY[Delivery service]
-subgraph DYNAMO_DB
-    COORDINATES[(Coordinates)]
+CUSTOMER([👤 Customer])
+ADMIN([👤 Admin])
+CUSTOMER_FE[Customer frontend\nReact]
+CUSTOMER --> |Orders\ncreate\npay| CUSTOMER_FE
+CUSTOMER_FE --> PAYMENT
+CUSTOMER_FE --> RESTAURANT
+subgraph AWS_VPC
+    ORDER[Order Service\nlambda] --> DB
+    RESTAURANT --> |CRUD MenuItems| DB_MENU_ITEMS
+    RESTAURANT --> |Read\nChange status| DB_ORDERS
+    ORDER --> SQS_TO_COURIERS[SQS\nNote to couries]
+    SQS_TO_COURIERS --> DELIVERY
+    subgraph DB
+        DB_MENU_ITEMS[Menu items]
+        DB_ORDERS[Orders]
+    end
+
+    subgraph DYNAMO_DB
+        COORDINATES[(Coordinates)]
+    end
+    COORDINATES_REDUCER([Coordinates reducer])
 end
-COORDINATES_REDUCER([Coordinates reducer])
+PAYMENT[Payment service] --> |Payment\nconfirmation|ORDER
