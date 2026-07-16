@@ -12,7 +12,7 @@
 | 1 | [SQS Standard Inbound](#1-sqs-standard-inbound) | → Delivery Service | SQS Standard `delivery-events` |
 | 2 | [SNS Standard Outbound](#2-sns-standard-outbound) | Delivery Service → | SNS Standard `order-events` |
 | 3 | [REST Inbound](#3-rest-api-inbound) | Clients → Delivery Service | ALB / HTTPS |
-| 4 | [REST Outbound](#4-rest-api-outbound) | Delivery Service → Services / APIs | Internal HTTPS + Waze API |
+| 4 | [REST Outbound](#4-rest-api-outbound) | Delivery Service → APIs | Waze API only — see §4 note (2026-07-16) |
 | 5 | [DynamoDB Writes](#5-dynamodb-write-shapes) | Delivery Service → DynamoDB | AWS SDK |
 | 6 | [CloudWatch Metrics](#6-cloudwatch-custom-metrics) | Delivery Service → CloudWatch | PutMetricData |
 
@@ -30,16 +30,15 @@ config:
 flowchart LR
     %% ─── External actors ───
     OS(["Order Service\nStep Functions"])
-    CA(["Courier App\nReact PWA"])
+    CA(["Courier App\nNext.js PWA"])
     CU(["Customer App\nNext.js"])
     OPS(["Ops Dashboard"])
-    US(["User Service"])
     SUB(["Notification Svc\nMonitoring Svc"])
     CW(["CloudWatch"])
 
     %% ─── Data stores ───
-    DY[("DynamoDB\ncourier_states\norder_events")]
-    SB[("Supabase\nassignments")]
+    DY[("DynamoDB\ncourier_states\ndelivery_assignments\norder_events")]
+    SB[("Supabase\ncourier_locations")]
 
     %% ─── Delivery Service ───
     DS["DELIVERY SERVICE\nFargate · Python + FastAPI"]
@@ -55,17 +54,13 @@ flowchart LR
     %% ─── Ch.2 SNS Standard Outbound ───
     DS -->|"② SNS Standard  order-events\ndelivery.courier_assigned\ndelivery.status.picked_up\ndelivery.status.delivered\ndelivery.status.failed\ndelivery.courier_reassigned"| SUB
 
-    %% ─── Ch.4 REST Outbound ───
-    DS -->|"④ REST internal\nGET /couriers/{id}/profile"| US
-    DS -->|"④ REST internal\nPATCH /orders/{orderId}/status\n→ DynamoDB UpdateItem  active_orders\nterminal state → archive to Supabase"| OS
-
     %% ─── Waze API ───
     WAZE(["Waze API"])
     DS -->|"④ HTTPS\nETA: courier→restaurant (assignment)\nETA: restaurant→customer (pre-payment)"| WAZE
 
     %% ─── Ch.5 DynamoDB + Supabase Writes ───
-    DS -->|"⑤ AWS SDK\ncourier_states  UpdateItem (GPS every 10 sec)\nactive_orders  UpdateItem (eligible_courier_ids)\norder_events  PutItem"| DY
-    DS -->|"⑤ HTTPS  every 10 min (GPS sync)\ncourier_locations  upsert (PostGIS)\nassignments  write"| SB
+    DS -->|"⑤ AWS SDK\ncourier_states  UpdateItem (GPS every 10 sec)\ndelivery_assignments  PutItem/UpdateItem (eligible_courier_ids, accept)\norder_events  PutItem"| DY
+    DS -->|"⑤ HTTPS  every 10 min (GPS sync)\ncourier_locations  upsert (PostGIS)"| SB
 
     %% ─── Ch.6 CloudWatch Metrics ───
     DS -->|"⑥ PutMetricData\nCourierAssignmentLagSeconds\nUnacceptedOrdersCount\nStageMachineErrorCount"| CW
@@ -80,7 +75,11 @@ flowchart LR
     class DS ds
 ```
 
-> Arrow numbers correspond to Channel Overview rows. `DS` ↔ `CA` and `DS` ↔ `CU` are bidirectional via REST. `DS` ↔ `OS` is bidirectional — Order Service pushes SQS events in (Ch.1) and receives REST status patches out (Ch.4). Waze API is called both during assignment (Ch.4) and for pre-payment ETA.
+> Arrow numbers correspond to Channel Overview rows. `DS` ↔ `CA` and `DS` ↔ `CU` are bidirectional via REST.
+> `DS` → `OS` is one-directional: Order Service pushes SQS events in (Ch.1); Delivery Service notifies back
+> only via SNS `delivery.status.*` events (Ch.2), never a REST callback — the `PATCH /orders/{orderId}/status`
+> call shown in earlier revisions of this diagram was removed 2026-07-16, confirmed never implemented (see
+> §4 below). Waze API is called both during assignment (Ch.4) and for pre-payment ETA.
 
 ---
 
@@ -325,7 +324,9 @@ Courier App sends GPS position every **10 seconds**. Delivery Service writes to 
 }
 ```
 
-**Response 200** — empty body.
+**Response 204** — no body. (Corrected 2026-07-16: implemented and confirmed as `204`, not `200` — this
+matches the service's own `README.md` and `courier-frontend`'s client, which guards for a `204` with no
+JSON body. This doc previously disagreed with both.)
 
 ---
 
@@ -408,10 +409,15 @@ Courier accepts an available order. **First-writer wins** — Delivery Service p
 **Response 409**
 ```json
 {
-  "error": "ALREADY_ASSIGNED",
+  "error": "CONFLICT",
   "message": "Another courier accepted this order first"
 }
 ```
+
+> Corrected 2026-07-16: implemented as `"error": "CONFLICT"`, not `ALREADY_ASSIGNED` — matches
+> `README.md`'s convention (this repo's `shared/errors/app_error.py` always raises `ConflictError` →
+> `CONFLICT` for 409s). `courier-frontend` never depended on the exact string, only the `409` status code,
+> so this was a safe pick.
 
 ---
 
@@ -466,7 +472,9 @@ Customer confirms delivery in the Customer App. Once both courier (`newStage: DE
 
 ### `GET /api/v1/deliveries/{orderId}`
 
-Returns current delivery state for an order. Reads from DynamoDB `active_orders` (order status) and `courier_states` (courier last-known GPS).  
+Returns current delivery state for an order. Reads from DynamoDB `delivery_assignments` (this service's own
+assignment/eligibility table — not Order Service's `active_orders`, see §4.7/§0.7) and `courier_states`
+(courier last-known GPS).
 **Callers:** Customer App · Ops Dashboard · Order Service.  
 **Primary tracking mechanism for Customer App** — polled every 5 seconds. `courierLastLocation` reflects the last GPS push from Courier App (up to 10 sec old).
 
@@ -489,6 +497,9 @@ Authorization: Bearer <jwt_access_token>
     "lng": 34.7850,
     "updatedAt": "2026-06-28T19:15:00.000Z"
   },
+  "restaurantName": "HaBurger",
+  "restaurantAddress": { "lat": 32.0853, "lng": 34.7818, "street": "Rothschild Blvd 1", "city": "Tel Aviv", "addressId": null },
+  "customerAddress": { "lat": 32.0742, "lng": 34.7922, "street": "Ben Yehuda St 44", "city": "Tel Aviv", "addressId": "addr-789" },
   "estimatedDeliveryTime": "2026-06-28T19:30:00.000Z",
   "assignedAt": "2026-06-28T18:51:00.000Z",
   "pickedUpAt": "2026-06-28T19:07:00.000Z",
@@ -497,15 +508,22 @@ Authorization: Bearer <jwt_access_token>
 ```
 
 > **`status` enum (delivery-owned):** `ASSIGNED` · `PICKED_UP` · `DELIVERED` · `FAILED`  
-> `courierLastLocation` — last known position from Courier App GPS push (every 10 sec). Max staleness: ~10 sec.
+> `courierLastLocation` — last known position from Courier App GPS push (every 10 sec). Max staleness: ~10 sec.  
+> **Added 2026-07-16:** `restaurantName` / `restaurantAddress` / `customerAddress` — previously missing
+> from this response despite `courier-frontend`'s `Delivery.ts` needing them to navigate after accepting
+> (see platform `ARCHITECTURE.md` and this repo's own `docs/ARCHITECTURE.md` §0.8). `restaurantName` is a
+> best-effort Supabase `venues` lookup and can be `null`; the address objects are always present.
 
 **Response 404**
 ```json
 {
-  "error": "DELIVERY_NOT_FOUND",
+  "error": "NOT_FOUND",
   "message": "No delivery assignment found for order order-xyz"
 }
 ```
+
+> Corrected 2026-07-16: implemented as `"error": "NOT_FOUND"` (this repo's shared `NotFoundError` →
+> `NOT_FOUND` convention), not `DELIVERY_NOT_FOUND`.
 
 ---
 
@@ -518,24 +536,29 @@ Fargate ECS health check. Returns `200` when all internal modules are ready; use
 {
   "status": "ok",
   "modules": {
-    "sqs_consumer": "ready",
-    "assignment_engine": "ready",
-    "gps_sync_scheduler": "ready",
-    "waze_client": "ready"
+    "sqsConsumer": "ready",
+    "assignmentEngine": "ready",
+    "gpsSyncScheduler": "ready",
+    "wazeClient": "ready"
   },
   "timestamp": "2026-06-28T19:00:00.000Z"
 }
 ```
+
+> Corrected 2026-07-16: module keys are camelCase (`sqsConsumer`, not `sqs_consumer`), matching
+> `README.md` and the actual implementation — this doc previously disagreed with both. `wazeClient` can
+> also report `"not_configured"` (no `WAZE_API_KEY` set) — an accepted state, not a degradation; only
+> `"error"` on any module marks the overall response `503`.
 
 **Response 503** — returned when any critical module fails to initialise. ALB stops routing traffic to this task.
 ```json
 {
   "status": "degraded",
   "modules": {
-    "sqs_consumer": "error",
-    "assignment_engine": "ready",
-    "gps_sync_scheduler": "ready",
-    "waze_client": "ready"
+    "sqsConsumer": "error",
+    "assignmentEngine": "ready",
+    "gpsSyncScheduler": "ready",
+    "wazeClient": "ready"
   },
   "timestamp": "2026-06-28T19:00:00.000Z"
 }
@@ -545,19 +568,27 @@ Fargate ECS health check. Returns `200` when all internal modules are ready; use
 
 ## 4. REST API Outbound
 
-> Calls made **by** Delivery Service **to** other microservices and external APIs.  
-> Internal calls use a service JWT in the `Authorization` header.
+> Calls made **by** Delivery Service **to** external APIs. **Status (2026-07-16):** the only real outbound
+> call is to Waze. The courier-profile lookup once documented here as an outbound call to User Service is
+> actually an endpoint Delivery Service exposes itself (see the note under §3 above), and the
+> `PATCH /orders/{orderId}/status` outbound call was never implemented (§0.6, confirmed by grep) — both
+> corrected below rather than kept as stale entries.
 
 ---
 
-### `GET /api/v1/couriers/{courierId}/profile` → User Service
+### `GET /api/v1/couriers/{courierId}/profile`
 
-Called by the **Assignment Engine** after filtering to fetch profile details (name, phone) for the selected courier before emitting the `delivery.courier_assigned` event.
+**Corrected 2026-07-16 — this is not an outbound call.** Delivery Service does not call out to a separate
+User Service for this; it exposes this endpoint itself (see this repo's own `docs/PLAN.md` Phase 2), backed
+by a best-effort direct Supabase query (`couriers` joined to `users`). `name`/`phone`/`vehicleType` are
+`null` if Supabase isn't configured or the courier isn't found, rather than fabricated. It's called from the
+**accept handler** (`POST /deliveries/{orderId}/accept`) to populate `delivery.courier_assigned` — not from
+the Assignment Engine, which only computes eligibility and never fetches profile data (see this repo's own
+`docs/PLAN.md` Phase 4, step 5).
 
 **Request**
 ```
 GET /api/v1/couriers/courier-001/profile
-Authorization: Bearer <internal_service_jwt>
 ```
 
 **Response 200**
@@ -608,29 +639,15 @@ Same endpoint, `from` = restaurant coords, `to` = customer delivery address coor
 
 ---
 
-### `PATCH /api/v1/orders/{orderId}/status` → Order Service
+### ~~`PATCH /api/v1/orders/{orderId}/status` → Order Service~~ — removed, never implemented
 
-Called by the **Stage State Machine** whenever a delivery stage changes. Order Service updates `active_orders` in DynamoDB (`UpdateItem`). On terminal states (`DELIVERED` / `FAILED`), Order Service additionally archives the complete order record to Supabase PostgreSQL (`orders` + `order_items` tables) and deletes the DynamoDB item once the archive write succeeds.
-
-**Request body**
-```json
-{
-  "status": "DELIVERED",
-  "actorId": "courier-001",
-  "timestamp": "2026-06-23T19:28:00.000Z"
-}
-```
-
-> **`status` enum:** `PICKED_UP` · `DELIVERED` · `FAILED`
-
-**Response 200**
-```json
-{
-  "orderId": "order-xyz",
-  "status": "DELIVERED",
-  "updatedAt": "2026-06-23T19:28:00.000Z"
-}
-```
+**Removed 2026-07-16.** This outbound REST call does not exist anywhere in Delivery Service's codebase and
+was never built. `order-service-message-contracts.md`'s revision notes explicitly removed this endpoint —
+"Delivery updates status only via SNS (consumed over SQS)" — and this repo's own
+`docs/ARCHITECTURE.md` §0.6 documents that decision: **Delivery Service notifies Order Service only by
+publishing `delivery.status.*` events to SNS** (§2 above), never via a direct REST callback. A grep for
+`orders/{orderId}/status` or `orders.*status` across `delivery-service/src/` returns nothing. Do not
+resurrect this as a design option without re-confirming with whoever owns Order Service first.
 
 ---
 
@@ -724,6 +741,45 @@ Written on **every delivery stage transition** by the Stage State Machine. Immut
 
 ---
 
+### Table: `delivery_assignments`
+
+**Added 2026-07-16** — this table wasn't previously documented here. PK `order_id`, no SK. Delivery
+Service's own courier-assignment/eligibility record, created on `order.preparing` and owned exclusively by
+this service (never Order Service's `active_orders` — see §0.7 in this repo's own `docs/ARCHITECTURE.md`).
+Field names are snake_case internally (unlike the camelCase wire DTOs) since this table has no cross-repo
+contract of its own.
+
+```json
+{
+  "order_id": "order-xyz",
+  "restaurant_id": "rest-456",
+  "restaurant_address": { "lat": 32.0853, "lng": 34.7818, "street": "Rothschild Blvd 1", "city": "Tel Aviv" },
+  "delivery_address": { "lat": 32.0742, "lng": 34.7922, "address_id": "addr-789" },
+  "items": [{ "name": "Shakshuka", "quantity": 2 }],
+  "currency": "ILS",
+  "total_amount": 78.50,
+  "eligible_courier_ids": ["courier-001"],
+  "assigned_courier_id": "courier-001",
+  "stage": "PICKED_UP",
+  "estimated_pickup_time": "2026-06-28T19:05:00.000Z",
+  "estimated_delivery_time": "2026-06-28T19:30:00.000Z",
+  "assigned_at": "2026-06-28T18:51:45.000Z",
+  "picked_up_at": "2026-06-28T19:07:00.000Z",
+  "delivered_at": null,
+  "courier_confirmed": false,
+  "customer_confirmed": false,
+  "created_at": "2026-06-28T18:50:00.000Z",
+  "updated_at": "2026-06-28T19:07:00.000Z"
+}
+```
+
+> `stage` is absent (not an empty/null attribute — the key itself is omitted) until a courier accepts; the
+> `DeliveryStage` enum (`ASSIGNED`/`PICKED_UP`/`DELIVERED`/`FAILED`) only models post-acceptance states.  
+> `assigned_courier_id`'s conditional write (`attribute_not_exists`) is the first-writer-wins mechanism
+> behind the accept endpoint's `409` — see §3 above.
+
+---
+
 ## 6. CloudWatch Custom Metrics
 
 > Published via `PutMetricData`. Namespace: `FoodDelivery/DeliveryService`.  
@@ -737,6 +793,12 @@ Written on **every delivery stage transition** by the Stage State Machine. Immut
 | `GpsSyncJobFailureCount` | Count | 0 | > 0 (any failure) |
 | `WazeApiErrorRate` | Percent | 0.5 | > 10% per 5 min |
 | `EligibleCouriersFound` | Count | 4 | < 1 for > 3 orders (no coverage alert) |
+
+> **Status (2026-07-16):** all metrics except `UnacceptedOrdersCount` are emitted from real call sites
+> (Assignment Engine, Waze client, GPS sync job, the stage endpoint). `UnacceptedOrdersCount` is a periodic
+> aggregate ("orders still unaccepted after N minutes") with no natural per-event call site in what's been
+> built so far — it belongs to a scheduled monitoring pass (Monitoring Service, platform `ARCHITECTURE.md`
+> §4.2), not something Delivery Service's own request/event handlers can emit inline. Still an open item.
 
 **Example `PutMetricData` shape**
 

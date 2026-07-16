@@ -1,7 +1,7 @@
 # Food Delivery Platform — High Level Architecture (HLA) + MVP Plan
 
 **Scale:** ~100,000 users | 300 restaurants | 2,000 couriers  
-**Stack:** Next.js on Vercel (Customer Web) + React (Ops apps) · Node.js/Express · Python/FastAPI (Delivery Service) · AWS Fargate (Delivery Service, Menu Service) · AWS Lambda · Supabase (PostgreSQL + pgvector) · DynamoDB · MongoDB Atlas · AWS (Cognito [Restaurant/Admin/Courier], SNS Standard, SQS Standard, Bedrock, CloudWatch, S3/CloudFront) · Firebase OAuth 2.0 (Customer auth) · Waze API (ETA) · OpenAI API (optional)
+**Stack:** Next.js on Vercel (Customer Web) + Next.js (Courier PWA) + React (Restaurant/Ops dashboards) · Node.js/Express · Python/FastAPI (Delivery Service) · AWS Fargate (Delivery Service, Menu Service) · AWS Lambda · Supabase (PostgreSQL + pgvector) · DynamoDB · MongoDB Atlas · AWS (Cognito [Restaurant/Admin/Courier], SNS Standard, SQS Standard, Bedrock, CloudWatch, S3/CloudFront) · Firebase OAuth 2.0 (Customer auth) · Waze API (ETA) · OpenAI API (optional)
 
 ---
 
@@ -19,7 +19,7 @@ Customer → Browse → Order → Payment → [auto] Preparing → Pickup → De
 |---|---|---|
 | Customer App | 100K end-users | Next.js on Vercel (SSR/SSG, SEO-first) |
 | Restaurant / Shop Dashboard | 300 restaurants + 10K shops | React |
-| Courier App | 2,000 couriers | React PWA |
+| Courier App | 2,000 couriers | Next.js PWA |
 | Operations & Monitoring Dashboard | Admin / ops team | React |
 
 ---
@@ -199,7 +199,7 @@ style OrderServiceStack fill:transparent,stroke:transparent,color:transparent
 - Availability toggle (open / closed)
 - Sales reports (daily, weekly)
 
-### 3.3 Courier App (React PWA)
+### 3.3 Courier App (Next.js PWA)
 
 **Pages / Features:**
 - Login (role: `COURIER` — Cognito)
@@ -414,7 +414,7 @@ Stripe's native `idempotency_key` prevents double-charging at the payment layer.
 | Service | Owned Tables | External Dependencies |
 |---|---|---|
 | Order Service | `active_orders` (DynamoDB — live state); `orders`, `order_items` (Supabase — archive on terminal state) | Reads: `menu_items`, `restaurants`, `payments` (via REST) |
-| Delivery Service | `courier_states`, `order_events` (DynamoDB); `assignments`, `courier_locations` (Supabase) | Reads: `active_orders` (DynamoDB); calls Waze API for ETAs |
+| Delivery Service | `courier_states`, `delivery_assignments`, `order_events` (DynamoDB); `courier_locations` (Supabase) | Reads: none from Order Service's `active_orders` — owns its own assignment/eligibility state (`delivery_assignments`) instead; calls Waze API for ETAs |
 | Menu Service | `menu_items`, `categories` (Supabase — writes) | Reads: `restaurants` (via REST or direct); calls Bedrock for AI dish cards |
 | Catalog Service | — (read-only) | Reads: `menu_items`, `restaurants`, `categories` (Supabase — read only) |
 | Payment Service | `payments` | Reads: `orders` (via REST); writes event to SNS |
@@ -581,8 +581,20 @@ order_events         PK: order_id     SK: event_time  (stage, actor_id)
                        • courier_id when READY→PICKED_UP (courier picks up food)
                        • courier_id or customer_id when PICKED_UP→DELIVERED (both must confirm)
                      ↳ Why store here? Immutable event log for compliance, analytics, and debugging delivery issues
+courier_states       PK: courierId    (no SK)   Delivery Service — live courier status + last known GPS
+                     ↳ status: offline | available | busy; currentOrderId set only while busy
+                     ↳ lastLocation upserted every 10 sec from the Courier App's GPS PATCH
+                     ↳ GSI_couriers_by_status       (PK: status,          SK: updatedAt)
+                     ↳ GSI_courier_by_current_order (PK: currentOrderId)
+delivery_assignments PK: order_id     (no SK)   Delivery Service's own courier-assignment/eligibility state
+                     ↳ Owned exclusively by Delivery Service — never writes to Order Service's active_orders
+                       (see §4.7 "no cross-service database writes")
+                     ↳ eligible_courier_ids, assigned_courier_id (conditional write, first-writer-wins on
+                       accept), stage, timestamps
 ```
-> DynamoDB handles active order state (all in-flight transitions) and the immutable event log — all append-only or single-item updates requiring single-digit ms latency.
+> DynamoDB handles active order state (all in-flight transitions), live courier tracking, Delivery
+> Service's own assignment state, and the immutable event log — all append-only or single-item updates
+> requiring single-digit ms latency.
 
 ### MongoDB Atlas (sessions — document store)
 ```
@@ -609,7 +621,7 @@ config:
 graph TB
     subgraph CDN["Static Frontend"]
         R53[Route53\nDNS] --> CF2[CloudFront CDN]
-        CF2 --> S3F[S3 Bucket\nReact builds — Restaurant / Courier / Ops]
+        CF2 --> S3F[S3 Bucket\nReact builds — Restaurant / Ops · Next.js static export — Courier]
         VERCEL[Vercel\nCustomer App — Next.js]
     end
 
@@ -754,10 +766,11 @@ sequenceDiagram
 - **Change Streams** provide lightweight pub/sub for cases where sub-millisecond latency is not needed
 - **Atlas Free Tier (M0)** for MVP → $0 until scale demands M10 ($57/mo)
 
-### Why Next.js for Customer + React for dashboards/PWA?
+### Why Next.js for Customer + Courier, React for back-office dashboards?
 - Customer App gets SSR/SSG for SEO-critical discovery pages (landing, cuisine, restaurant)
-- React remains optimal for back-office dashboards and courier PWA workflows
-- PWA capability is preserved where mobile-installable behavior is needed (Courier App)
+- Courier App moved to Next.js (static export) to share tooling, TypeScript types, and UI components with the Customer App codebase, while keeping the same CloudFront/S3 hosting model
+- PWA capability (installable, offline shell) is preserved under Next.js via `next-pwa`
+- React remains optimal for the Restaurant and Ops back-office dashboards, where CSR is sufficient and SEO is irrelevant
 - Team can share UI components across Next.js and React apps using a common package
 
 ### Why AWS Bedrock + pgvector RAG?
@@ -815,7 +828,7 @@ sequenceDiagram
 
 | Day | Engineer A | Engineer B | Engineer C |
 |---|---|---|---|
-| **1** | AWS setup: Cognito (staff), DynamoDB, SQS Standard queues + SNS Standard topics, Supabase project init (incl. PostGIS) | AWS setup: API Gateway, ECS cluster (Fargate), MongoDB Atlas cluster, CloudFormation templates | Project scaffold: Next.js on Vercel (Customer) + 3 React apps (CloudFront), routing |
+| **1** | AWS setup: Cognito (staff), DynamoDB, SQS Standard queues + SNS Standard topics, Supabase project init (incl. PostGIS) | AWS setup: API Gateway, ECS cluster (Fargate), MongoDB Atlas cluster, CloudFormation templates | Project scaffold: Next.js on Vercel (Customer) + Next.js (Courier, CloudFront) + 2 React apps (CloudFront), routing |
 | **2** | User Service: register, login, JWT + Firebase OAuth 2.0 (Customer), Cognito (staff), roles (Lambda + Supabase) | Catalog Service: restaurants/menus read (Lambda + Supabase) · Menu Service: Fargate container setup, menu CRUD | Customer App: Firebase login page, protected routes |
 | **3** | Order Service: create order, state machine (PENDING→PREPARING auto on payment), Waze ETA integration | Menu Service: product images (S3), categories, AI dish card (Bedrock) | Restaurant Dashboard: Login (Cognito), order queue (polling), mark READY, menu management via Menu Service |
 | **4** | Order Service: full state machine + SNS Standard event publishing | Delivery Service: Fargate setup, GPS handler (10 s), GPS sync scheduler (10 min DynamoDB→Supabase), PostGIS nearest-courier query | Customer App: Browse, cart, order placement + ETA display from Waze |
@@ -836,7 +849,7 @@ sequenceDiagram
 ---
 
 ### Deliverables After 2 Weeks
-- [ ] Customer App (Next.js on Vercel) + 3 React apps deployed via CloudFront
+- [ ] Customer App (Next.js on Vercel) + Courier App (Next.js) + 2 React apps deployed via CloudFront
 - [ ] 8 Lambda microservices deployed (SAM)
 - [ ] Delivery Service on Fargate (GPS 10 s, GPS sync 10 min, Waze ETA, PostGIS assignment, 30 s courier poll)
 - [ ] Menu Service on Fargate (restaurant menu CRUD + AI dish card)
@@ -1029,7 +1042,7 @@ Node.js services follow the same four-folder pattern (`handlers / features / ent
 | features | `manage-menu` (via Menu Service), `ai-dish-card` (name/photo → Bedrock → prefill form), `mark-order-ready`, `toggle-availability`, `view-reports` |
 | entities | `incoming-order`, `menu-item` (incl. `timeToPrepare`, `nutrition`, `aiGenerated`), `restaurant` |
 
-**`courier-app/`** — React PWA · Cognito auth
+**`courier-app/`** — Next.js PWA (static export) · Cognito auth
 
 | Layer | Slices |
 |---|---|
@@ -1364,7 +1377,8 @@ Delivery Service  →  Waze API (restaurant → customer address)
       LIMIT 20
 3. For each of the 20 nearest couriers:
       Waze API (courier lastLocation → restaurant) → keep couriers ≤ X minutes away
-4. Write eligible_courier_ids to DynamoDB active_orders record
+4. Write eligible_courier_ids to DynamoDB delivery_assignments record (this service's own table —
+      not Order Service's active_orders; see below)
 5. Courier Apps poll GET /deliveries/available every 30 sec
       → response includes orders for which this courierId is in eligible_courier_ids
 6. Courier taps "Take order"  →  POST /deliveries/{orderId}/accept
@@ -1402,8 +1416,8 @@ graph TB
     end
 
     subgraph DataStores["Data stores"]
-        DY[(DynamoDB\ncourier_states · active_orders\norder_events)]
-        SB[(Supabase\ncourier_locations · assignments)]
+        DY[(DynamoDB\ncourier_states · delivery_assignments\norder_events)]
+        SB[(Supabase\ncourier_locations)]
         WAZE[Waze API\nETA calculations]
     end
 
@@ -1431,9 +1445,7 @@ graph TB
     AE --> DY
     POLL --> DY
     ACCH --> DY
-    ACCH --> SB
     SM --> DY
-    SM --> SB
     SM --> SNS_OUT
     Fargate --> CW
 ```
@@ -1445,10 +1457,10 @@ graph TB
 | **GPS handler** | Writes courier GPS to DynamoDB `courier_states.lastLocation`; called every 10 sec from Courier App | `PATCH /couriers/{id}/gps` |
 | **GPS sync scheduler** | Reads all active courier GPS from DynamoDB; batch-upserts `courier_locations` (PostGIS geometry) in Supabase for spatial nearest-courier queries | In-process APScheduler job, every 10 min |
 | **ETA handler** | Calls Waze API for restaurant→customer travel time; returned to Order Service pre-payment so customer sees delivery ETA at checkout | `GET /deliveries/eta` |
-| **Assignment engine** | On `order.preparing`: (1) PostGIS query for 20 nearest couriers to restaurant, (2) Waze API per courier for arrival time to restaurant, (3) keep those ≤ threshold minutes, (4) write `eligible_courier_ids` to DynamoDB `active_orders` | SQS consumer: `order.preparing` |
+| **Assignment engine** | On `order.preparing`: (1) PostGIS query for 20 nearest couriers to restaurant, (2) Waze API per courier for arrival time to restaurant, (3) keep those ≤ threshold minutes, (4) write `eligible_courier_ids` to DynamoDB `delivery_assignments` (this service's own table, not Order Service's `active_orders`) | SQS consumer: `order.preparing` |
 | **Poll handler** | Returns available paid orders for which this courier is listed in `eligible_courier_ids` | `GET /deliveries/available` — Courier App polls every 30 sec |
 | **Accept handler** | Conditional DynamoDB write — first writer wins; 409 if already assigned | `POST /deliveries/{id}/accept` |
-| **Stage state machine** | `PICKED_UP → DELIVERED` transitions; writes to `order_events` (DynamoDB), updates `assignments` (Supabase), publishes to SNS Standard. Delivery confirmed when both courier and customer tap Confirm — no photo required | Courier `POST /stage`; Customer `POST /confirm-delivery` |
+| **Stage state machine** | `PICKED_UP → DELIVERED` transitions; writes to `order_events` and `delivery_assignments` (DynamoDB), publishes to SNS Standard. Delivery confirmed when both courier and customer tap Confirm — no photo required | Courier `POST /stage`; Customer `POST /confirm-delivery` |
 | **SQS consumer** | Polls `delivery-events` queue; routes events to Assignment Engine or Stage Machine | SQS Standard |
 
 ### 15.5 Data Stores Used
@@ -1456,10 +1468,9 @@ graph TB
 | Store | Table | Purpose |
 |-------|-------|---------|
 | DynamoDB | `courier_states` | Live GPS written every 10 sec; status (available/busy/offline) |
-| DynamoDB | `active_orders` | Order state + `eligible_courier_ids` written by Assignment Engine |
+| DynamoDB | `delivery_assignments` | This service's own assignment/eligibility state — `eligible_courier_ids`, `assigned_courier_id`, stage, timestamps. Not Order Service's `active_orders` (no cross-service database writes) |
 | DynamoDB | `order_events` | Immutable stage-transition audit log |
 | Supabase | `courier_locations` | PostGIS geometry column; batch-updated every 10 min from DynamoDB |
-| Supabase | `assignments` | Permanent assignment records (courier + order) |
 
 ### 15.6 Scaling & Resilience
 
