@@ -8,26 +8,32 @@ CUSTOMER([👤 Customer])
 ADMIN([👤 Admin])
 CUSTOMER_FE[Customer frontend\nReact]
 CUSTOMER --> |Orders\ncreate\npay| CUSTOMER_FE
-CUSTOMER_FE --> PAYMENT
-CUSTOMER_FE --> RESTAURANT
+CUSTOMER_FE --> |Step 1\nDishes browsing\nCart filling|RESTAURANT
+CUSTOMER_FE --> |Step 2\nPayment|PAYMENT
 subgraph AWS_VPC
-    ORDER[Order Service\nlambda] --> DB
+    ORDER[Order Service\nlambda] --> |Order\nStatus->Paid|DB_ORDERS
     RESTAURANT --> |CRUD MenuItems| DB_MENU_ITEMS
     RESTAURANT --> |Read\nChange status| DB_ORDERS
+    RESTAURANT --> |When ready\nto puck up|ORDER
     ORDER --> |Order is ready\nto pick up|SQS_TO_COURIERS[SQS\nNote to couries]
     SQS_TO_COURIERS --> DELIVERY
     subgraph DB
         DB_MENU_ITEMS[Menu items]
         DB_ORDERS[Orders]
+        COORDINATED_DB[(Coordinates DB)]
     end
 
     subgraph DYNAMO_DB
         COORDINATES[(Coordinates)]
     end
     COORDINATES_REDUCER([Coordinates reducer])
+    COORDINATES_REDUCER --> |Get\nReduce\ncoordinates|COORDINATES
+    COORDINATES_REDUCER --> COORDINATED_DB
+
     SLA_VIOLATION([SLA violation\nmonitoring])
     ALERT([Alerts service])
     SLA_VIOLATION --> DYNAMO_DB --> ALERT
     ALERT --> |Send alert|ADMIN
+    DELIVERY --> |Order\ncompleted|ORDER
 end
 PAYMENT[Payment service] --> |Payment\nconfirmation|ORDER
